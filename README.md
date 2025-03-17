@@ -16,6 +16,7 @@ Environment variables:
 - `PORT`: The port the proxy server should listen on (default: 3000)
 - `REASONING_MODEL`: The reasoning model to use (default: `google/gemini-2.0-pro-exp-02-05:free`)
 - `COMPLETION_MODEL`: The completion model to use (default: `google/gemini-2.0-pro-exp-02-05:free`)
+- `DEBUG`: Set to `1` to enable debug logging
 
 
 ## Claude Code

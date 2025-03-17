@@ -12,6 +12,10 @@ const models = {
 const fastify = Fastify({
   logger: true
 })
+function debug(...args) {
+  if (!process.env.DEBUG) return
+  console.log(...args)
+}
 
 // Helper function to send SSE events and flush immediately.
 const sendSSE = (reply, event, data) => {
@@ -147,6 +151,7 @@ fastify.post('/v1/messages', async (request, reply) => {
       stream: payload.stream === true,
     }
     if (tools.length > 0) openaiPayload.tools = tools
+    debug('OpenAI payload:', openaiPayload)
 
     const openaiResponse = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
@@ -155,7 +160,7 @@ fastify.post('/v1/messages', async (request, reply) => {
         'Authorization': `Bearer ${key}`
       },
       body: JSON.stringify(openaiPayload)
-    })
+    });
 
     if (!openaiResponse.ok) {
       const errorDetails = await openaiResponse.text()
@@ -166,6 +171,7 @@ fastify.post('/v1/messages', async (request, reply) => {
     // If stream is not enabled, process the complete response.
     if (!openaiPayload.stream) {
       const data = await openaiResponse.json()
+      debug('OpenAI response:', data)
       if (data.error) {
         throw new Error(data.error.message)
       }
@@ -266,6 +272,7 @@ fastify.post('/v1/messages', async (request, reply) => {
       done = doneReading
       if (value) {
         const chunk = decoder.decode(value)
+        debug('OpenAI response chunk:', chunk)
         // OpenAI streaming responses are typically sent as lines prefixed with "data: "
         const lines = chunk.split('\n')
 
