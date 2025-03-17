@@ -5,8 +5,8 @@ import { TextDecoder } from 'util'
 const key = process.env.OPENROUTER_API_KEY
 const model = 'google/gemini-2.0-pro-exp-02-05:free'
 const models = {
-  reasoning: model,
-  completion: model,
+  reasoning: process.env.REASONING_MODEL || model,
+  completion: process.env.COMPLETION_MODEL || model,
 }
 
 const fastify = Fastify({
