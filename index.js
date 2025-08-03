@@ -1,7 +1,10 @@
 import Fastify from 'fastify'
+import cors from '@fastify/cors'
 import fetch from 'node-fetch'
 
 const fastify = Fastify({ logger: true })
+
+await fastify.register(cors, { origin: '*' })
 
 fastify.post('/v1/complete', async (request, reply) => {
   const { model, prompt, max_tokens } = request.body
@@ -11,7 +14,7 @@ fastify.post('/v1/complete', async (request, reply) => {
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01'
+      'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
       model,
@@ -19,10 +22,10 @@ fastify.post('/v1/complete', async (request, reply) => {
       messages: [
         {
           role: 'user',
-          content: prompt
-        }
-      ]
-    })
+          content: prompt,
+        },
+      ],
+    }),
   })
 
   const data = await response.json()
@@ -33,6 +36,7 @@ const start = async () => {
   try {
     await fastify.listen({ port: process.env.PORT || 3000, host: '0.0.0.0' })
   } catch (err) {
+    fastify.log.error(err)
     process.exit(1)
   }
 }
