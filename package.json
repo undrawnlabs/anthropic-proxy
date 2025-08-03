@@ -29,6 +29,6 @@
   "license": "MIT",
   "dependencies": {
     "fastify": "^4.5.2",
-    "@fastify/cors": "^8.2.1"
+    "node-fetch": :^3.3.2"
   }
 }
