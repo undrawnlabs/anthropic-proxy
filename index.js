@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import cors from '@fastify/cors'
 import Fastify from 'fastify'
 import { TextDecoder } from 'util'
 
