@@ -27,6 +27,7 @@
   },
   "author": "Max Nowack <max.nowack@gmail.com>",
   "license": "MIT",
+  "type": "module",
   "dependencies": {
     "fastify": "^4.5.2",
     "node-fetch": "^3.3.2",
