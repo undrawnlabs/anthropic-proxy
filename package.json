@@ -28,7 +28,7 @@
   "author": "Max Nowack <max.nowack@gmail.com>",
   "license": "MIT",
   "dependencies": {
-    "fastify": "^4.5.2"
+    "fastify": "^4.5.2",
     "@fastify/cors": "^8.2.1"
   }
 }
