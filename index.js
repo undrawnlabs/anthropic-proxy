@@ -15,6 +15,21 @@ const models = {
 const fastify = Fastify({
   logger: true
 })
+fastify.post('/v1/complete', async (request, reply) => {
+  const { model, prompt, max_tokens } = request.body;
+
+  const response = await fetch("https://openrouter.ai/api/v1/complete", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ model, prompt, max_tokens })
+  });
+
+  const data = await response.json();
+  reply.send(data);
+});
 function debug(...args) {
   if (!process.env.DEBUG) return
   console.log(...args)
