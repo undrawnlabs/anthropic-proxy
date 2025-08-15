@@ -1,9 +1,9 @@
-// index.js — final
+// index.js — final (no auth guard)
 // Fastify + Upstash Redis + Anthropic Messages API
-// Cost-efficient memory: STB (short-term buffer) + LTM (archive) + Summary + Targeted recall
+// Cost-efficient memory: STB + LTM + Summary + Targeted recall
 // Node 18.x
 // ENV (required): ANTHROPIC_API_KEY, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, CORE_SYSTEM_PROMPT (or SYSTEM_PROMPT_BASE)
-// ENV (optional): OPENAI_API_KEY, BACKEND_API_KEY, PORT, STB_MAX_ITEMS, RECALL_TOP_K, LTM_SCAN_LIMIT, TOKEN_BUDGET, MAX_OUTPUT_TOKENS, ANTHROPIC_MODEL, ROUTE_PREFIX, ANTHROPIC_TEMPERATURE
+// ENV (optional): OPENAI_API_KEY, PORT, STB_MAX_ITEMS, RECALL_TOP_K, LTM_SCAN_LIMIT, TOKEN_BUDGET, MAX_OUTPUT_TOKENS, ANTHROPIC_MODEL, ROUTE_PREFIX, ANTHROPIC_TEMPERATURE
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -17,7 +17,6 @@ const {
   CORE_SYSTEM_PROMPT,
   SYSTEM_PROMPT_BASE: SP_FALLBACK,
   OPENAI_API_KEY,
-  BACKEND_API_KEY,
   PORT = 3000,
   ANTHROPIC_MODEL = 'claude-3-5-sonnet-20240620',
   ROUTE_PREFIX = '',
@@ -35,7 +34,7 @@ await app.register(cors, { origin: true });
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
 
 // ---- Tunables ----
-const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30;
 const STB_MAX_ITEMS = Number(process.env.STB_MAX_ITEMS || 20); // ~10 turns (user+assistant counted separately)
 const RECALL_TOP_K = Number(process.env.RECALL_TOP_K || 6);
 const LTM_SCAN_LIMIT = Number(process.env.LTM_SCAN_LIMIT || 1500);
@@ -47,13 +46,6 @@ const TEMPERATURE = Number(ANTHROPIC_TEMPERATURE);
 const keySTB = (coreId, sessionId) => `stb:${coreId}:${sessionId}`;   // LIST
 const keyLTM = (coreId, sessionId) => `ltm:${coreId}:${sessionId}`;   // LIST
 const keySUM = (coreId, sessionId) => `sum:${coreId}:${sessionId}`;   // STRING
-
-// ---- Guards (optional) ----
-app.addHook('onRequest', async (req, reply) => {
-  if (!BACKEND_API_KEY) return; // disabled if not set
-  const got = req.headers['x-backend-key'];
-  if (got !== BACKEND_API_KEY) return reply.code(401).send({ error: 'unauthorized' });
-});
 
 // ---- Helpers ----
 const toAnthropicMessage = (item) => ({
@@ -148,7 +140,7 @@ async function recallFromLTM(coreId, sessionId, userMsg) {
   const all = await lrangeJSON(redis, keyLTM(coreId, sessionId), -LTM_SCAN_LIMIT, -1);
   if (!all.length) return [];
   let qEmb = null;
-  if (OPENAI_API_KEY) { try { qEmb = await embedText(userMsg); } catch { /* noop */ } }
+  if (OPENAI_API_KEY) { try { qEmb = await embedText(userMsg); } catch {} }
   const scored = all.map((e) => {
     const content = String(e.content || '');
     const score = (qEmb && Array.isArray(e.emb)) ? cosineSim(qEmb, e.emb) : keywordScore(userMsg, content);
@@ -208,7 +200,7 @@ async function rolloverSTBIfNeeded(coreId, sessionId) {
   for (const e of toMove) {
     const item = { ...e };
     if (OPENAI_API_KEY) {
-      try { const emb = await embedText(String(e.content || '')); if (emb) item.emb = emb; } catch { /* noop */ }
+      try { const emb = await embedText(String(e.content || '')); if (emb) item.emb = emb; } catch {}
     }
     enriched.push(item);
   }
@@ -229,8 +221,7 @@ const chatHandler = async (req, reply) => {
   const content = user_message ?? prompt;
   if (!core_id || !session_id || !content) {
     return reply.code(400).send({ error: 'bad_request', detail: 'core_id, session_id, and user_message/prompt are required' });
-  }
-
+    }
   const userEntry = { role: 'user', content, ts: Date.now(), locale };
   const { system, messages } = await buildPrompt({ coreId: core_id, sessionId: session_id, locale, userEntry });
 
@@ -249,7 +240,6 @@ const chatHandler = async (req, reply) => {
   const assistantText = Array.isArray(data.content) && data.content[0]?.type === 'text' ? data.content[0].text : '';
   const assistantEntry = { role: 'assistant', content: assistantText, ts: Date.now(), locale };
 
-  // Persist both user and assistant in STB
   await appendList(redis, keySTB(core_id, session_id), userEntry, assistantEntry);
   await ltrimKeepLast(redis, keySTB(core_id, session_id), STB_MAX_ITEMS);
   await rolloverSTBIfNeeded(core_id, session_id);
@@ -269,14 +259,12 @@ app.get(`${r}/debug/tokens`, async (req) => {
   return { input_tokens: tokens, system_chars: system.length, messages_count: messages.length };
 });
 app.post(`${r}/chat`, chatHandler);
-
-// Legacy aliases (backward compatibility)
+// Legacy aliases
 app.post(`${r}/v1/chat`, chatHandler);
 app.post(`${r}/complete`, chatHandler);
 app.post(`${r}/v1/complete`, chatHandler);
 app.post(`${r}/api/chat`, chatHandler);
-
-// Admin: purge session
+// Admin: purge
 app.post(`${r}/purge`, async (req, reply) => {
   const { core_id, session_id } = req.body || {};
   if (!core_id || !session_id) return reply.code(400).send({ error: 'bad_request', detail: 'core_id and session_id required' });
@@ -286,10 +274,8 @@ app.post(`${r}/purge`, async (req, reply) => {
   return reply.send({ ok: true });
 });
 
-// Log routes
+// Log routes and start
 app.ready().then(() => app.log.info(app.printRoutes()));
-
-// Start
 app.listen({ port: Number(PORT), host: '0.0.0.0' })
   .then(addr => app.log.info(`listening on ${addr}`))
   .catch(err => { app.log.error(err); process.exit(1); });
