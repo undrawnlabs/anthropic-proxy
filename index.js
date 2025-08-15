@@ -1,5 +1,5 @@
 // index.js — Render + Upstash Redis + Anthropic Messages API
-// Single-user persistent memory (core_id + session_id) — Redis LISTS (append-only)
+// Persistent memory via Redis LIST (append-only). Reads full context from Redis.
 
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
@@ -8,62 +8,48 @@ import { Redis } from '@upstash/redis'
 
 // ===== Config =====
 const PORT = process.env.PORT || 10000
-const HISTORY_MAX = parseInt(process.env.HISTORY_MAX_MESSAGES || '400', 10)
-// TTL: if set (seconds) → key auto-expires; if unset → persistent
-const TTL_SECONDS = process.env.TTL_SECONDS ? parseInt(process.env.TTL_SECONDS, 10) : null
 const CORE = (process.env.CORE_SYSTEM_PROMPT || '').trim()
+const HISTORY_MAX = parseInt(process.env.HISTORY_MAX_MESSAGES || '400', 10)
+// TTL (seconds). If set -> auto-expire keys. If unset -> persistent.
+const TTL_SECONDS = process.env.TTL_SECONDS ? parseInt(process.env.TTL_SECONDS, 10) : null
 const DEBUG = !!process.env.DEBUG
 
-// ===== Redis (with RAM fallback) =====
+// ===== Redis =====
 const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
   ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
   : null
 
-const RAM = new Map()
-const keyOf = (coreId, sessionId) => `hist:${coreId || 'exec'}:${sessionId}`
+const keyOf = (coreId, sessionId) => `histlist:${coreId || 'exec'}:${sessionId}`
 
-// --- Read full history (LIST -> array of {role,content})
+// Read full history (LIST -> [{role,content}, ...])
 async function readHistory(coreId, sessionId) {
   const key = keyOf(coreId, sessionId)
-  if (redis) {
-    const arr = await redis.lrange(key, 0, -1) // array of strings
-    const parsed = arr.map(s => {
-      try { return JSON.parse(s) } catch { return null }
-    }).filter(Boolean)
-    if (DEBUG) console.log('[READ]', key, 'len=', parsed.length)
-    return parsed
-  } else {
-    const v = RAM.get(key) || []
-    if (DEBUG) console.log('[READ:RAM]', key, 'len=', v.length)
-    return v
-  }
+  if (!redis) return []
+  const arr = await redis.lrange(key, 0, -1) // strings
+  const items = arr.map(s => { try { return JSON.parse(s) } catch { return null } }).filter(Boolean)
+  if (DEBUG) console.log('[READ]', key, 'len=', items.length)
+  return items
 }
 
-// --- Append messages & trim to HISTORY_MAX (RPUSH + LTRIM)
+// Append messages & trim (RPUSH + LTRIM)
 async function appendHistory(coreId, sessionId, newMessages) {
   const key = keyOf(coreId, sessionId)
-  if (redis) {
-    const payloads = newMessages.map(m => JSON.stringify(m))
-    // push both messages atomically (server side)
-    const newLen = await redis.rpush(key, ...payloads) // returns new length
-    if (HISTORY_MAX && newLen > HISTORY_MAX) {
-      // keep last HISTORY_MAX items
-      const start = newLen - HISTORY_MAX
-      await redis.ltrim(key, start, -1)
-    }
-    if (TTL_SECONDS && TTL_SECONDS > 0) {
-      await redis.expire(key, TTL_SECONDS) // refresh TTL on write
-    }
-    if (DEBUG) console.log('[APPEND]', key, 'added=', newMessages.length, 'len≈', Math.min(newLen, HISTORY_MAX))
-    return true
-  } else {
-    const cur = RAM.get(key) || []
-    const next = [...cur, ...newMessages]
-    const trimmed = HISTORY_MAX ? next.slice(-HISTORY_MAX) : next
-    RAM.set(key, trimmed)
-    if (DEBUG) console.log('[APPEND:RAM]', key, 'len=', trimmed.length)
-    return true
+  if (!redis) return
+  const payloads = newMessages.map(m => JSON.stringify(m))
+  const newLen = await redis.rpush(key, ...payloads)
+  if (HISTORY_MAX && newLen > HISTORY_MAX) {
+    await redis.ltrim(key, newLen - HISTORY_MAX, -1)
   }
+  if (TTL_SECONDS && TTL_SECONDS > 0) await redis.expire(key, TTL_SECONDS)
+  if (DEBUG) console.log('[APPEND]', key, 'added=', newMessages.length)
+}
+
+// Convert our history to Anthropic messages format
+function toAnthropicMessages(history) {
+  return (history || []).map(m => ({
+    role: m.role, // 'user' | 'assistant'
+    content: [{ type: 'text', text: String(m.content ?? '') }]
+  }))
 }
 
 // ===== Server =====
@@ -79,12 +65,12 @@ app.get('/health', async () => ({
 
 /**
  * POST /v1/complete
+ * Body:
  * {
  *   "core_id": "exec",
  *   "session_id": "perm-1",
  *   "model": "claude-3-7-sonnet-20250219",
  *   "prompt": "text",
- *   "locale": "uk",
  *   "max_tokens": 500
  * }
  */
@@ -95,7 +81,6 @@ app.post('/v1/complete', async (req, reply) => {
       session_id,
       model,
       prompt,
-      locale = 'uk',
       max_tokens = 500
     } = req.body || {}
 
@@ -103,27 +88,18 @@ app.post('/v1/complete', async (req, reply) => {
     if (!prompt) return reply.code(400).send({ ok:false, error:'prompt_required' })
     if (!session_id) return reply.code(400).send({ ok:false, error:'session_id_required' })
 
-    // 1) read current history
+    // 1) read entire history from Redis
     const history = await readHistory(core_id, session_id)
 
-    // 2) system prompt (core + language discipline)
-    const languageDiscipline = [
-      'Language Discipline:',
-      `• Respond only in the user's language: ${locale}.`,
-      '• Do not translate unless explicitly asked.',
-      '• Do not mix languages in a single reply.',
-      '• No hallucinations — if unknown: "Unknown with current data."'
-    ].join('\n')
-    const system = [CORE, languageDiscipline].filter(Boolean).join('\n\n')
+    // 2) build system
+    const system = CORE || ''
 
-    // 3) Anthropic messages: history + current user
-    const anthroHistory = history.map(m => ({
-      role: m.role,
-      content: [{ type: 'text', text: m.content }]
-    }))
+    // 3) build Anthropic messages: full history + current user
+    const anthroHistory = toAnthropicMessages(history)
     const userMsg = { role: 'user', content: [{ type: 'text', text: String(prompt) }] }
-    const messages = [...anthroHistory, userMsg]
-    // для безпеки: если история велика — Anthropic все одно має ліміт контексту
+    const messages = [...anthroHistory, userMsg].slice(-HISTORY_MAX)
+
+    if (DEBUG) app.log.info({ sendLen: messages.length }, 'anthropic_payload')
 
     // 4) call Anthropic
     const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -133,7 +109,13 @@ app.post('/v1/complete', async (req, reply) => {
         'x-api-key': process.env.ANTHROPIC_API_KEY,
         'anthropic-version': '2023-06-01'
       },
-      body: JSON.stringify({ model, max_tokens, system, messages })
+      body: JSON.stringify({
+        model,
+        max_tokens,
+        temperature: 0,
+        system,
+        messages
+      })
     })
 
     if (!r.ok) {
@@ -149,19 +131,15 @@ app.post('/v1/complete', async (req, reply) => {
         : (data?.content?.text ?? '')
     const assistantReply = (text || '').trim()
 
-    // 5) append both messages to Redis LIST
+    // 5) append both messages to Redis
     await appendHistory(core_id, session_id, [
       { role: 'user',      content: String(prompt) },
       { role: 'assistant', content: assistantReply }
     ])
 
-    // 6) (optional) return current length — читаємо швидко (без JSON парсу)
+    // 6) length hint
     let messagesLen = null
-    if (redis) {
-      messagesLen = await redis.llen(keyOf(core_id, session_id))
-    } else {
-      messagesLen = (RAM.get(keyOf(core_id, session_id)) || []).length
-    }
+    if (redis) messagesLen = await redis.llen(keyOf(core_id, session_id))
 
     return reply.send({
       ok: true,
@@ -183,20 +161,15 @@ app.post('/v1/complete', async (req, reply) => {
 app.get('/v1/history/len', async (req, reply) => {
   const { core_id = 'exec', session_id } = req.query || {}
   if (!session_id) return reply.code(400).send({ ok:false, error:'session_id_required' })
-  if (redis) {
-    const n = await redis.llen(keyOf(core_id, session_id))
-    return reply.send({ ok:true, messages: n, cap: HISTORY_MAX })
-  } else {
-    const n = (RAM.get(keyOf(core_id, session_id)) || []).length
-    return reply.send({ ok:true, messages: n, cap: HISTORY_MAX })
-  }
+  const n = redis ? await redis.llen(keyOf(core_id, session_id)) : 0
+  return reply.send({ ok:true, messages: n, cap: HISTORY_MAX })
 })
 
 app.delete('/v1/history', async (req, reply) => {
   const { core_id = 'exec', session_id } = req.query || {}
   if (!session_id) return reply.code(400).send({ ok:false, error:'session_id_required' })
   const key = keyOf(core_id, session_id)
-  if (redis) await redis.del(key); else RAM.delete(key)
+  if (redis) await redis.del(key)
   return reply.send({ ok:true, cleared:true })
 })
 
