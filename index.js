@@ -1,4 +1,6 @@
-// index.js — Render + Upstash Redis + Anthropic Messages API with persistent STATE
+// index.js — Render + Upstash Redis + Anthropic Messages API
+// Native context memory: full message history + optional structured STATE
+
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import fetch from 'node-fetch';
@@ -13,12 +15,14 @@ const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_R
   : null;
 
 const RAM_STATE = new Map();
+const RAM_HISTORY = new Map();
 const TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+const HISTORY_MAX = parseInt(process.env.HISTORY_MAX_MESSAGES || '30', 10);
 
-// 1) STATE helpers
+// 1) STATE helpers (optional structured memory)
 function extractState(text) {
   const m = text?.match?.(/STATE:\s*({[\s\S]+?})\s*$/);
-  return m ? m[1] : null; // returns JSON string or null
+  return m ? m[1] : null; // JSON string or null
 }
 function stripState(text) {
   return text?.replace?.(/STATE:\s*({[\s\S]+?})\s*$/, '').trim() ?? '';
@@ -43,37 +47,48 @@ async function setState(coreId, sessionId, stateJSON) {
   }
 }
 
-// 2) Minimal default core (used if CORE_SYSTEM_PROMPT is not set)
-const DEFAULT_CORE = `
-You are undrawn labs Executive Core.
-- Never invent facts. If unknown: "Unknown with current data."
-- Respond in the user's language only.
-- At the end of each reply, append a single line STATE: {"product": <string|null>, "phase": <string|null>, "notes": <string|null>}
-  - Only include fields you are confident about.
-  - If not sure, use null. Do not guess.
-  - Keep STATE on one line, valid JSON, no trailing text after it.
-`.trim();
-
-// 3) Light parser to capture explicit state from user prompt (UA/EN/RU)
-function parseExplicitStateFromPrompt(prompt) {
-  if (!prompt) return null;
-  const norm = prompt.replace(/\s+/g, ' ').trim();
-
-  // UA examples: "Запам'ятай: продукт — X; фаза — Y"
-  // EN examples: "Remember: product — X; phase — Y"
-  // Variants: "product:", "продукт:", "-", "—"
-  const prodMatch = norm.match(/(?:продукт|product)\s*[:\-—]\s*([^;,.]+)\s*/i);
-  const phaseMatch = norm.match(/(?:фаза|phase)\s*[:\-—]\s*([^;,.]+)\s*/i);
-
-  if (!prodMatch && !phaseMatch) return null;
-
-  const product = prodMatch ? prodMatch[1].trim() : null;
-  const phase = phaseMatch ? phaseMatch[1].trim() : null;
-
-  return { product, phase };
+// 2) History helpers (native context)
+function historyKey(coreId, sessionId) {
+  return `hist:${coreId || 'exec'}:${sessionId}`;
+}
+async function getHistory(coreId, sessionId) {
+  const key = historyKey(coreId, sessionId);
+  if (redis) {
+    const v = await redis.get(key);
+    if (!v) return [];
+    try { return JSON.parse(v); } catch { return []; }
+  }
+  const v = RAM_HISTORY.get(key);
+  return Array.isArray(v) ? v : [];
+}
+async function setHistory(coreId, sessionId, history) {
+  const key = historyKey(coreId, sessionId);
+  const trimmed = Array.isArray(history) ? history.slice(-HISTORY_MAX) : [];
+  const payload = JSON.stringify(trimmed);
+  if (redis) {
+    await redis.set(key, payload, { ex: TTL_SECONDS });
+  } else {
+    RAM_HISTORY.set(key, trimmed);
+  }
+}
+function cryptoRandom() {
+  // UUID v4 without deps
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
 }
 
-// 4) Fastify server
+// 3) Default core (if CORE_SYSTEM_PROMPT not provided)
+const DEFAULT_CORE = `
+You are undrawn labs Executive Core.
+- No hallucinations. If unknown: "Unknown with current data."
+- Analyst/operator tone. No generic marketing phrases.
+- Respond only in the user's language.
+- If appropriate, append one-line STATE: {"product": "...", "phase": "..."} at the very end.
+`.trim();
+
+// 4) Server
 const fastify = Fastify({ logger: true });
 await fastify.register(cors, { origin: '*' });
 
@@ -98,35 +113,28 @@ fastify.post('/v1/complete', async (request, reply) => {
 
     const sid = session_id || cryptoRandom();
 
-    // 4.1 Load previous STATE (JSON string or null)
+    // 4.1 Load memory
     const lastStateJSON = await getState(core_id, sid);
-    let lastState = null;
-    try { lastState = lastStateJSON ? JSON.parse(lastStateJSON) : null; } catch {}
+    const history = await getHistory(core_id, sid); // array of {role, content}
 
-    // 4.2 If user explicitly set product/phase, merge and save immediately
-    const explicit = parseExplicitStateFromPrompt(prompt);
-    if (explicit) {
-      const merged = {
-        product: explicit.product ?? lastState?.product ?? null,
-        phase: explicit.phase ?? lastState?.phase ?? null,
-        notes: lastState?.notes ?? null
-      };
-      await setState(core_id, sid, JSON.stringify(merged));
-    }
-
-    // 4.3 Build system prompt (env or default) and include LAST_STATE
+    // 4.2 Build system prompt
     const core = process.env.CORE_SYSTEM_PROMPT || DEFAULT_CORE;
-    const effectiveLastJSON = await getState(core_id, sid); // may have just been updated
     const system = [
       core,
-      effectiveLastJSON ? `LAST_STATE: ${effectiveLastJSON}` : '',
+      lastStateJSON ? `LAST_STATE: ${lastStateJSON}` : '',
       `Language Discipline:
 • Respond only in the user's language: ${locale}.
 • Do not translate unless asked.
 • Do not mix languages in one reply.`
     ].filter(Boolean).join('\n\n');
 
-    // 4.4 Call Anthropic Messages API
+    // 4.3 Compose messages with native context
+    const messages = [
+      ...history, // previous {role:'user'|'assistant', content:string}
+      { role: 'user', content: prompt }
+    ].slice(-HISTORY_MAX);
+
+    // 4.4 Call Anthropic
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -138,7 +146,7 @@ fastify.post('/v1/complete', async (request, reply) => {
         model,
         max_tokens,
         system,
-        messages: [{ role: 'user', content: prompt }]
+        messages
       })
     });
 
@@ -149,17 +157,23 @@ fastify.post('/v1/complete', async (request, reply) => {
 
     const data = await resp.json();
 
-    // 4.5 Extract text
-    const text = Array.isArray(data?.content)
+    // 4.5 Extract assistant text
+    const fullText = Array.isArray(data?.content)
       ? data.content.map(c => c?.text ?? '').join('')
       : (data?.content?.text ?? '');
 
-    // 4.6 Save new STATE if model appended it
-    const newState = extractState(text);
-    if (newState) await setState(core_id, sid, newState);
+    const stateJSON = extractState(fullText);
+    if (stateJSON) await setState(core_id, sid, stateJSON);
 
-    // 4.7 Return visible content without STATE
-    const content = stripState(text);
+    const content = stripState(fullText);
+
+    // 4.6 Update history (native memory)
+    const newHistory = [
+      ...history,
+      { role: 'user', content: prompt },
+      { role: 'assistant', content } // store clean text (no STATE)
+    ];
+    await setHistory(core_id, sid, newHistory);
 
     return reply.send({
       ok: true,
@@ -173,12 +187,20 @@ fastify.post('/v1/complete', async (request, reply) => {
   }
 });
 
-// Optional: quick debug endpoint to read raw STATE
+// Optional: read raw STATE
 fastify.get('/v1/state', async (request, reply) => {
   const { session_id, core_id = 'exec' } = request.query || {};
   if (!session_id) return reply.code(400).send({ ok: false, error: 'session_id required' });
   const s = await getState(core_id, session_id);
   return reply.send({ ok: true, state: s ? JSON.parse(s) : null });
+});
+
+// Optional: read history length
+fastify.get('/v1/history/len', async (request, reply) => {
+  const { session_id, core_id = 'exec' } = request.query || {};
+  if (!session_id) return reply.code(400).send({ ok: false, error: 'session_id required' });
+  const h = await getHistory(core_id, session_id);
+  return reply.send({ ok: true, messages: Array.isArray(h) ? h.length : 0, max: HISTORY_MAX });
 });
 
 // 5) Start server
@@ -187,12 +209,3 @@ fastify.listen({ port: PORT, host: '0.0.0.0' }).catch((err) => {
   fastify.log.error(err);
   process.exit(1);
 });
-
-// Utils
-function cryptoRandom() {
-  // UUID v4 generator without extra deps
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-    const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
-    return v.toString(16);
-  });
-}
