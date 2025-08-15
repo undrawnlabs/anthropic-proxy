@@ -1,6 +1,5 @@
 // index.js — final, multilingual memory via STATE + budgeted context
 // Fastify + Upstash Redis + Anthropic Messages API
-// Node 18+
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
