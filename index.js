@@ -1,27 +1,25 @@
 // index.js — Render + Upstash Redis + Anthropic Messages API
-// Native persistent context (full history) + optional system prompt + locale discipline
+// Native conversation memory (full history). No triggers. No field extraction.
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import fetch from 'node-fetch';
 import { Redis } from '@upstash/redis';
 
-// ===== 0) Config =====
+// ===== Config =====
 const PORT = process.env.PORT || 10000;
-const TTL_SECONDS = 60 * 60 * 24 * 30;           // 30 days
-const HISTORY_MAX = parseInt(process.env.HISTORY_MAX_MESSAGES || '30', 10);
-const CORE = (process.env.CORE_SYSTEM_PROMPT || '').trim();
+const TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+const HISTORY_MAX = parseInt(process.env.HISTORY_MAX_MESSAGES || '40', 10);
+const CORE = (process.env.CORE_SYSTEM_PROMPT || '').trim(); // optional system prompt
 
-// ===== 1) Redis (with RAM fallback) =====
+// ===== Redis (with RAM fallback) =====
 const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
   ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
   : null;
 
-const RAM = new Map(); // fallback for history only
+const RAM = new Map(); // fallback only if Redis absent
 
-function histKey(coreId, sessionId) {
-  return `hist:${coreId || 'exec'}:${sessionId}`;
-}
+const histKey = (coreId, sessionId) => `hist:${coreId || 'exec'}:${sessionId}`;
 
 async function getHistory(coreId, sessionId) {
   const key = histKey(coreId, sessionId);
@@ -51,12 +49,12 @@ function uuid() {
   });
 }
 
-// ===== 2) Fastify =====
+// ===== Server =====
 const app = Fastify({ logger: true });
 await app.register(cors, { origin: '*' });
 
 // Health
-app.get('/health', async () => ({ ok:true, service:'undrawn-core', redis: !!redis }));
+app.get('/health', async () => ({ ok: true, service: 'undrawn-core', redis: !!redis }));
 
 /**
  * POST /v1/complete
@@ -64,10 +62,10 @@ app.get('/health', async () => ({ ok:true, service:'undrawn-core', redis: !!redi
  * {
  *   "model": "claude-3-7-sonnet-20250219",
  *   "prompt": "user text",
- *   "session_id": "optional",          // if missing, server generates and returns it
- *   "core_id": "exec | other",         // optional, for isolating multiple cores
- *   "locale": "uk | en | ru",          // default "uk"
- *   "max_tokens": 500                  // optional
+ *   "session_id": "optional (server will generate if missing)",
+ *   "core_id": "exec|any",
+ *   "locale": "uk|en|ru",   // optional; used only to hint language discipline
+ *   "max_tokens": 500       // optional
  * }
  */
 app.post('/v1/complete', async (req, reply) => {
@@ -82,24 +80,25 @@ app.post('/v1/complete', async (req, reply) => {
     } = req.body || {};
 
     if (!model || !prompt) {
-      return reply.code(400).send({ ok:false, error:'model and prompt are required' });
+      return reply.code(400).send({ ok: false, error: 'model and prompt are required' });
     }
 
-    // 1) load history
     const sid = session_id || uuid();
-    const history = await getHistory(core_id, sid); // [{role,content}, ...]
 
-    // 2) build system
+    // 1) load full conversation history
+    const history = await getHistory(core_id, sid); // [{role:'user'|'assistant', content:'...'}, ...]
+
+    // 2) system (optional): core + strict language discipline
     const languageDiscipline = [
       `Language Discipline:`,
       `• Respond only in the user's language: ${locale}.`,
       `• Do not translate unless asked.`,
-      `• Do not mix languages in one reply.`
+      `• Do not mix languages in one reply.`,
+      `• No hallucinations; if unknown: "Unknown with current data."`
     ].join('\n');
-
     const system = [CORE, languageDiscipline].filter(Boolean).join('\n\n');
 
-    // 3) compose messages
+    // 3) compose messages: entire history + current user turn
     const messages = [
       ...history,
       { role: 'user', content: prompt }
@@ -117,18 +116,17 @@ app.post('/v1/complete', async (req, reply) => {
     });
 
     if (!r.ok) {
-      const detail = await r.text().catch(()=> '');
-      return reply.code(r.status).send({ ok:false, error:'anthropic_error', detail });
+      const detail = await r.text().catch(() => '');
+      return reply.code(r.status).send({ ok: false, error: 'anthropic_error', detail });
     }
 
     const data = await r.json();
     const text = Array.isArray(data?.content)
       ? data.content.map(c => c?.text ?? '').join('')
       : (data?.content?.text ?? '');
-
     const assistantReply = (text || '').trim();
 
-    // 5) update history and persist
+    // 5) persist updated history
     const newHistory = [
       ...history,
       { role: 'user', content: prompt },
@@ -144,10 +142,26 @@ app.post('/v1/complete', async (req, reply) => {
 
   } catch (err) {
     req.log.error(err);
-    return reply.code(500).send({ ok:false, error:'server_error' });
+    return reply.code(500).send({ ok: false, error: 'server_error' });
   }
 });
 
-// ===== 3) Start =====
+// Debug helpers (optional)
+app.get('/v1/history/len', async (req, reply) => {
+  const { session_id, core_id = 'exec' } = req.query || {};
+  if (!session_id) return reply.code(400).send({ ok: false, error: 'session_id required' });
+  const h = await getHistory(core_id, session_id);
+  return reply.send({ ok: true, messages: Array.isArray(h) ? h.length : 0, cap: HISTORY_MAX });
+});
+
+app.delete('/v1/history', async (req, reply) => {
+  const { session_id, core_id = 'exec' } = req.query || {};
+  if (!session_id) return reply.code(400).send({ ok: false, error: 'session_id required' });
+  const key = histKey(core_id, session_id);
+  if (redis) await redis.del(key); else RAM.delete(key);
+  return reply.send({ ok: true, cleared: true });
+});
+
+// Start
 app.listen({ port: PORT, host: '0.0.0.0' })
   .catch(err => { app.log.error(err); process.exit(1); });
