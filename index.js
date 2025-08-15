@@ -1,26 +1,31 @@
-// index.js — final (no auth guard)
+// index.js — final, aligned with updated CORE_SYSTEM_PROMPT
 // Fastify + Upstash Redis + Anthropic Messages API
-// Cost-efficient memory: STB + LTM + Summary + Targeted recall
+// Memory model: STB (short-term buffer) + LTM (archive) + Summary + Targeted recall
+// Economy: token budget + safe trimming (no full reread of 400+ turns)
 // Node 18.x
-// ENV (required): ANTHROPIC_API_KEY, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, CORE_SYSTEM_PROMPT (or SYSTEM_PROMPT_BASE)
-// ENV (optional): OPENAI_API_KEY, PORT, STB_MAX_ITEMS, RECALL_TOP_K, LTM_SCAN_LIMIT, TOKEN_BUDGET, MAX_OUTPUT_TOKENS, ANTHROPIC_MODEL, ROUTE_PREFIX, ANTHROPIC_TEMPERATURE
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import fetch from 'node-fetch';
 import { Redis } from '@upstash/redis';
 
+// ---------- ENV ----------
 const {
   ANTHROPIC_API_KEY,
   UPSTASH_REDIS_REST_URL,
   UPSTASH_REDIS_REST_TOKEN,
   CORE_SYSTEM_PROMPT,
-  SYSTEM_PROMPT_BASE: SP_FALLBACK,
-  OPENAI_API_KEY,
+  SYSTEM_PROMPT_BASE: SP_FALLBACK, // optional fallback
+  OPENAI_API_KEY,                  // optional (improves recall quality)
   PORT = 3000,
   ANTHROPIC_MODEL = 'claude-3-5-sonnet-20240620',
   ROUTE_PREFIX = '',
   ANTHROPIC_TEMPERATURE = '0.2',
+  STB_MAX_ITEMS: STB_ENV,
+  RECALL_TOP_K: RECALL_ENV,
+  LTM_SCAN_LIMIT: LTM_ENV,
+  TOKEN_BUDGET: BUDGET_ENV,
+  MAX_OUTPUT_TOKENS: OUT_ENV,
 } = process.env;
 
 const SYSTEM_PROMPT_BASE = CORE_SYSTEM_PROMPT || SP_FALLBACK;
@@ -30,24 +35,23 @@ if (!ANTHROPIC_API_KEY || !UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN |
 
 const app = Fastify({ logger: true });
 await app.register(cors, { origin: true });
-
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
 
-// ---- Tunables ----
-const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30;
-const STB_MAX_ITEMS = Number(process.env.STB_MAX_ITEMS || 20); // ~10 turns (user+assistant counted separately)
-const RECALL_TOP_K = Number(process.env.RECALL_TOP_K || 6);
-const LTM_SCAN_LIMIT = Number(process.env.LTM_SCAN_LIMIT || 1500);
-const TOKEN_BUDGET = Number(process.env.TOKEN_BUDGET || 170_000);
-const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 1024);
+// ---------- Tunables ----------
+const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30;                     // 30 days
+const STB_MAX_ITEMS = Number(STB_ENV || 20);                        // ~10 turns (user+assistant counted separately)
+const RECALL_TOP_K = Number(RECALL_ENV || 6);                       // retrieved LTM items
+const LTM_SCAN_LIMIT = Number(LTM_ENV || 1500);                     // tail window for recall scan
+const TOKEN_BUDGET = Number(BUDGET_ENV || 170_000);                 // headroom under ~200k context
+const MAX_OUTPUT_TOKENS = Number(OUT_ENV || 1024);
 const TEMPERATURE = Number(ANTHROPIC_TEMPERATURE);
 
-// ---- Keys ----
-const keySTB = (coreId, sessionId) => `stb:${coreId}:${sessionId}`;   // LIST
-const keyLTM = (coreId, sessionId) => `ltm:${coreId}:${sessionId}`;   // LIST
-const keySUM = (coreId, sessionId) => `sum:${coreId}:${sessionId}`;   // STRING
+// ---------- Redis Keys ----------
+const keySTB = (coreId, sessionId) => `stb:${coreId}:${sessionId}`; // LIST
+const keyLTM = (coreId, sessionId) => `ltm:${coreId}:${sessionId}`; // LIST
+const keySUM = (coreId, sessionId) => `sum:${coreId}:${sessionId}`; // STRING
 
-// ---- Helpers ----
+// ---------- Helpers ----------
 const toAnthropicMessage = (item) => ({
   role: item.role === 'assistant' ? 'assistant' : 'user',
   content: [{ type: 'text', text: String(item.content ?? '') }],
@@ -57,17 +61,38 @@ async function ensureListKey(client, key) {
   const t = await client.type(key);
   if (t && t !== 'none' && t !== 'list') await client.del(key);
 }
+
+// IMPORTANT: push each entry as a separate Redis list item (no arrays-in-one-slot)
 async function appendList(client, key, ...entries) {
   if (!entries.length) return;
   await ensureListKey(client, key);
-  await client.rpush(key, entries.map((e) => JSON.stringify(e)));
+  const payloads = entries.map((e) => JSON.stringify(e));
+  await client.rpush(key, ...payloads);
   await client.expire(key, HISTORY_TTL_SECONDS);
 }
+
+// Backward-compatible reader: flattens old broken shape if any
 async function lrangeJSON(client, key, start, stop) {
   await ensureListKey(client, key);
   const raw = await client.lrange(key, start, stop);
-  return raw.map((s) => { try { return JSON.parse(s); } catch { return null; } }).filter(Boolean);
+  const out = [];
+  for (const s of raw) {
+    let v; try { v = JSON.parse(s); } catch { v = null; }
+    if (v == null) continue;
+    if (Array.isArray(v)) {
+      for (const inner of v) {
+        try {
+          const obj = typeof inner === 'string' ? JSON.parse(inner) : inner;
+          if (obj && typeof obj === 'object') out.push(obj);
+        } catch {}
+      }
+    } else if (typeof v === 'object') {
+      out.push(v);
+    }
+  }
+  return out;
 }
+
 async function ltrimKeepLast(client, key, maxItems) {
   await ensureListKey(client, key);
   await client.ltrim(key, -maxItems, -1);
@@ -82,7 +107,7 @@ async function writeSummary(client, key, text) {
   await client.expire(key, HISTORY_TTL_SECONDS);
 }
 
-// ---- Embeddings (optional) ----
+// ---------- Embeddings (optional) ----------
 async function embedText(text) {
   if (!OPENAI_API_KEY) return null;
   const res = await fetch('https://api.openai.com/v1/embeddings', {
@@ -106,7 +131,7 @@ function keywordScore(q, doc) {
   return inter / Math.sqrt((qT.size || 1) * (dT.size || 1));
 }
 
-// ---- Token counting ----
+// ---------- Token counting ----------
 async function countTokens({ system, messages, model }) {
   const res = await fetch('https://api.anthropic.com/v1/messages/count_tokens', {
     method: 'POST',
@@ -118,7 +143,7 @@ async function countTokens({ system, messages, model }) {
   return data.input_tokens ?? 0;
 }
 
-// ---- Summary builder (heuristic) ----
+// ---------- Summary builder (heuristic) ----------
 function updateSummaryHeuristic(prevSummary, entries) {
   const facts = [];
   const add = (line) => { const t = String(line || '').trim(); if (t && t.length <= 220) facts.push(`- ${t}`); };
@@ -135,7 +160,7 @@ function updateSummaryHeuristic(prevSummary, entries) {
   return merged.slice(0, 1600);
 }
 
-// ---- Recall from LTM ----
+// ---------- Recall from LTM ----------
 async function recallFromLTM(coreId, sessionId, userMsg) {
   const all = await lrangeJSON(redis, keyLTM(coreId, sessionId), -LTM_SCAN_LIMIT, -1);
   if (!all.length) return [];
@@ -152,7 +177,7 @@ async function recallFromLTM(coreId, sessionId, userMsg) {
   return dedup;
 }
 
-// ---- Build prompt under budget ----
+// ---------- Build prompt under budget ----------
 async function buildPrompt({ coreId, sessionId, locale, userEntry }) {
   const stb = await lrangeJSON(redis, keySTB(coreId, sessionId), 0, -1);
   const summary = await readSummary(redis, keySUM(coreId, sessionId));
@@ -185,7 +210,7 @@ async function buildPrompt({ coreId, sessionId, locale, userEntry }) {
   return { system, messages };
 }
 
-// ---- STB → LTM rollover ----
+// ---------- STB → LTM rollover ----------
 async function rolloverSTBIfNeeded(coreId, sessionId) {
   const k = keySTB(coreId, sessionId);
   await ensureListKey(redis, k);
@@ -207,21 +232,22 @@ async function rolloverSTBIfNeeded(coreId, sessionId) {
   await appendList(redis, keyLTM(coreId, sessionId), ...enriched);
 }
 
-// ---- Summary maintenance ----
+// ---------- Summary maintenance ----------
 async function maybeRefreshSummary(coreId, sessionId, recentEntries) {
   const prev = await readSummary(redis, keySUM(coreId, sessionId));
   const next = updateSummaryHeuristic(prev, recentEntries);
   if (next !== prev) await writeSummary(redis, keySUM(coreId, sessionId), next);
 }
 
-// ---- Core handler ----
+// ---------- Core handler ----------
 const chatHandler = async (req, reply) => {
   const b = req.body || {};
   const { core_id, session_id, user_message, prompt, locale = 'uk' } = b;
   const content = user_message ?? prompt;
   if (!core_id || !session_id || !content) {
     return reply.code(400).send({ error: 'bad_request', detail: 'core_id, session_id, and user_message/prompt are required' });
-    }
+  }
+
   const userEntry = { role: 'user', content, ts: Date.now(), locale };
   const { system, messages } = await buildPrompt({ coreId: core_id, sessionId: session_id, locale, userEntry });
 
@@ -240,6 +266,7 @@ const chatHandler = async (req, reply) => {
   const assistantText = Array.isArray(data.content) && data.content[0]?.type === 'text' ? data.content[0].text : '';
   const assistantEntry = { role: 'assistant', content: assistantText, ts: Date.now(), locale };
 
+  // Append BOTH user and assistant to STB (two separate list items)
   await appendList(redis, keySTB(core_id, session_id), userEntry, assistantEntry);
   await ltrimKeepLast(redis, keySTB(core_id, session_id), STB_MAX_ITEMS);
   await rolloverSTBIfNeeded(core_id, session_id);
@@ -248,7 +275,7 @@ const chatHandler = async (req, reply) => {
   return reply.send({ core_id, session_id, locale, reply: assistantText });
 };
 
-// ---- Routes ----
+// ---------- Routes ----------
 const r = ROUTE_PREFIX;
 app.get(`${r}/health`, async () => ({ ok: true }));
 app.get(`${r}/debug/tokens`, async (req) => {
@@ -259,12 +286,14 @@ app.get(`${r}/debug/tokens`, async (req) => {
   return { input_tokens: tokens, system_chars: system.length, messages_count: messages.length };
 });
 app.post(`${r}/chat`, chatHandler);
-// Legacy aliases
+
+// Legacy aliases (to keep old clients working)
 app.post(`${r}/v1/chat`, chatHandler);
 app.post(`${r}/complete`, chatHandler);
 app.post(`${r}/v1/complete`, chatHandler);
 app.post(`${r}/api/chat`, chatHandler);
-// Admin: purge
+
+// Admin: purge a session (for clean tests)
 app.post(`${r}/purge`, async (req, reply) => {
   const { core_id, session_id } = req.body || {};
   if (!core_id || !session_id) return reply.code(400).send({ error: 'bad_request', detail: 'core_id and session_id required' });
@@ -274,7 +303,7 @@ app.post(`${r}/purge`, async (req, reply) => {
   return reply.send({ ok: true });
 });
 
-// Log routes and start
+// Startup logs
 app.ready().then(() => app.log.info(app.printRoutes()));
 app.listen({ port: Number(PORT), host: '0.0.0.0' })
   .then(addr => app.log.info(`listening on ${addr}`))
