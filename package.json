@@ -35,5 +35,6 @@
     "fastify": "^4.5.2",
     "node-fetch": "^3.3.2",
     "@fastify/cors": "^8.2.1"
+    "@upstash/redis": "^1.28.4"
   }
 }
