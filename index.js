@@ -1,6 +1,18 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import fetch from 'node-fetch'
+import { Redis } from '@upstash/redis';
+
+const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
+  ? new Redis({
+      url: process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN
+    })
+  : null;
+
+// Фолбек на RAM, якщо Redis не налаштований
+const RAM_STATE = new Map();
+const TTL_SECONDS = 60 * 60 * 24 * 30; // 30 днів
 
 const fastify = Fastify({ logger: true })
 
