@@ -1,4 +1,4 @@
-// index.js — Render + Upstash Redis + Anthropic Messages API
+// index.js — Render + Upstash Redis + Anthropic Messages API with persistent STATE
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import fetch from 'node-fetch';
@@ -43,7 +43,37 @@ async function setState(coreId, sessionId, stateJSON) {
   }
 }
 
-// 2) Fastify server
+// 2) Minimal default core (used if CORE_SYSTEM_PROMPT is not set)
+const DEFAULT_CORE = `
+You are undrawn labs Executive Core.
+- Never invent facts. If unknown: "Unknown with current data."
+- Respond in the user's language only.
+- At the end of each reply, append a single line STATE: {"product": <string|null>, "phase": <string|null>, "notes": <string|null>}
+  - Only include fields you are confident about.
+  - If not sure, use null. Do not guess.
+  - Keep STATE on one line, valid JSON, no trailing text after it.
+`.trim();
+
+// 3) Light parser to capture explicit state from user prompt (UA/EN/RU)
+function parseExplicitStateFromPrompt(prompt) {
+  if (!prompt) return null;
+  const norm = prompt.replace(/\s+/g, ' ').trim();
+
+  // UA examples: "Запам'ятай: продукт — X; фаза — Y"
+  // EN examples: "Remember: product — X; phase — Y"
+  // Variants: "product:", "продукт:", "-", "—"
+  const prodMatch = norm.match(/(?:продукт|product)\s*[:\-—]\s*([^;,.]+)\s*/i);
+  const phaseMatch = norm.match(/(?:фаза|phase)\s*[:\-—]\s*([^;,.]+)\s*/i);
+
+  if (!prodMatch && !phaseMatch) return null;
+
+  const product = prodMatch ? prodMatch[1].trim() : null;
+  const phase = phaseMatch ? phaseMatch[1].trim() : null;
+
+  return { product, phase };
+}
+
+// 4) Fastify server
 const fastify = Fastify({ logger: true });
 await fastify.register(cors, { origin: '*' });
 
@@ -66,22 +96,37 @@ fastify.post('/v1/complete', async (request, reply) => {
       return reply.code(400).send({ ok: false, error: 'model and prompt are required' });
     }
 
-    // Load previous STATE
     const sid = session_id || cryptoRandom();
-    const lastState = await getState(core_id, sid);
 
-    // Build system prompt
-    const core = process.env.CORE_SYSTEM_PROMPT || '';
+    // 4.1 Load previous STATE (JSON string or null)
+    const lastStateJSON = await getState(core_id, sid);
+    let lastState = null;
+    try { lastState = lastStateJSON ? JSON.parse(lastStateJSON) : null; } catch {}
+
+    // 4.2 If user explicitly set product/phase, merge and save immediately
+    const explicit = parseExplicitStateFromPrompt(prompt);
+    if (explicit) {
+      const merged = {
+        product: explicit.product ?? lastState?.product ?? null,
+        phase: explicit.phase ?? lastState?.phase ?? null,
+        notes: lastState?.notes ?? null
+      };
+      await setState(core_id, sid, JSON.stringify(merged));
+    }
+
+    // 4.3 Build system prompt (env or default) and include LAST_STATE
+    const core = process.env.CORE_SYSTEM_PROMPT || DEFAULT_CORE;
+    const effectiveLastJSON = await getState(core_id, sid); // may have just been updated
     const system = [
       core,
-      lastState ? `LAST_STATE: ${lastState}` : '',
+      effectiveLastJSON ? `LAST_STATE: ${effectiveLastJSON}` : '',
       `Language Discipline:
 • Respond only in the user's language: ${locale}.
 • Do not translate unless asked.
 • Do not mix languages in one reply.`
     ].filter(Boolean).join('\n\n');
 
-    // Call Anthropic Messages API
+    // 4.4 Call Anthropic Messages API
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -104,14 +149,16 @@ fastify.post('/v1/complete', async (request, reply) => {
 
     const data = await resp.json();
 
-    // Extract text
+    // 4.5 Extract text
     const text = Array.isArray(data?.content)
       ? data.content.map(c => c?.text ?? '').join('')
       : (data?.content?.text ?? '');
 
-    // Save new STATE and return clean content
+    // 4.6 Save new STATE if model appended it
     const newState = extractState(text);
     if (newState) await setState(core_id, sid, newState);
+
+    // 4.7 Return visible content without STATE
     const content = stripState(text);
 
     return reply.send({
@@ -126,7 +173,15 @@ fastify.post('/v1/complete', async (request, reply) => {
   }
 });
 
-// 3) Start server
+// Optional: quick debug endpoint to read raw STATE
+fastify.get('/v1/state', async (request, reply) => {
+  const { session_id, core_id = 'exec' } = request.query || {};
+  if (!session_id) return reply.code(400).send({ ok: false, error: 'session_id required' });
+  const s = await getState(core_id, session_id);
+  return reply.send({ ok: true, state: s ? JSON.parse(s) : null });
+});
+
+// 5) Start server
 const PORT = process.env.PORT || 10000;
 fastify.listen({ port: PORT, host: '0.0.0.0' }).catch((err) => {
   fastify.log.error(err);
