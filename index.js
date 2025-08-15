@@ -9,7 +9,7 @@ import { Redis } from '@upstash/redis';
 // ===== Config =====
 const PORT = process.env.PORT || 10000;
 const TTL_SECONDS = 60 * 60 * 24 * 30;                    // 30 days
-const HISTORY_MAX = parseInt(process.env.HISTORY_MAX_MESSAGES || '40', 10);
+const HISTORY_MAX = parseInt(process.env.HISTORY_MAX_MESSAGES || '400', 10);
 const CORE = (process.env.CORE_SYSTEM_PROMPT || '').trim(); // optional system/core prompt
 
 // ===== Redis (with RAM fallback) =====
