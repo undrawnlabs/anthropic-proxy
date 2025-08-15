@@ -143,21 +143,41 @@ async function countTokens({ system, messages, model }) {
   return data.input_tokens ?? 0;
 }
 
-// ---------- Summary builder (heuristic) ----------
+// ---- Summary builder (heuristic) ----
 function updateSummaryHeuristic(prevSummary, entries) {
   const facts = [];
-  const add = (line) => { const t = String(line || '').trim(); if (t && t.length <= 220) facts.push(`- ${t}`); };
+  const add = (line) => {
+    const t = String(line || '').trim();
+    if (!t) return;
+    const item = `- ${t}`;
+    if (!facts.includes(item)) facts.push(item);
+  };
+
+  // Simple multilingual patterns: EN + UA + RU (first-person, preferences, location)
+  const tests = [
+    // EN
+    (s) => /(^i\s*(am|work|live|prefer|use)\b)|(\bmy\s+[a-z]+)/i.test(s),
+    // UA
+    (s) => /(^я\s*(живу|переїхав|працюю|користуюсь|використовую|люблю|віддаю\s*перевагу)\b)|\b(мій|моя|моє|мої)\b/i.test(s),
+    // RU
+    (s) => /(^я\s*(живу|переехал|работаю|пользуюсь|использую|люблю|предпочитаю)\b)|\b(мой|моя|моё|мои)\b/i.test(s),
+  ];
+
   for (const e of entries) {
-    if (e.role === 'user') {
-      const t = String(e.content || '');
-      for (const c of t.split(/\n+/).slice(0, 3)) {
-        if (/(^i\s(am|work|live|prefer|use)\b)|(\bmy\s[a-z]+)/i.test(c) || /\b(is|=|:)\b/.test(c)) add(c);
-      }
+    if (e.role !== 'user') continue;
+    const text = String(e.content || '');
+    // split by sentence-ish boundaries
+    const parts = text.split(/[.\n!?]+/).map(x => x.trim()).filter(Boolean).slice(0, 6);
+    for (const p of parts) {
+      if (tests.some(fn => fn(p))) add(p);
     }
   }
+
   const head = `Memory state (concise facts from earlier context):`;
-  const merged = [ prevSummary ? prevSummary.trim() : `${head}\n- (none yet)`, ...(facts.length ? [`\n# New observations:\n${facts.join('\n')}`] : []) ].join('\n');
+  const base = prevSummary ? prevSummary.trim() : `${head}\n- (none yet)`;
+  const merged = facts.length ? `${base}\n# New observations:\n${facts.join('\n')}` : base;
   return merged.slice(0, 1600);
+}
 }
 
 // ---------- Recall from LTM ----------
