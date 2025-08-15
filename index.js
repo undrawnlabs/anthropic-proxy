@@ -8,7 +8,7 @@ import { Redis } from '@upstash/redis';
 
 // ===== Config =====
 const PORT = process.env.PORT || 10000;
-const TTL_SECONDS = 60 * 60 * 24 * 30;                 // 30 days
+const TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
 const HISTORY_MAX = parseInt(process.env.HISTORY_MAX_MESSAGES || '400', 10);
 const CORE = (process.env.CORE_SYSTEM_PROMPT || '').trim();
 
@@ -20,7 +20,6 @@ const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_R
 const RAM = new Map();
 const histKey = (coreId, sessionId) => `hist:${coreId || 'exec'}:${sessionId}`;
 
-// ===== Read full history =====
 async function getHistory(coreId, sessionId) {
   const key = histKey(coreId, sessionId);
   if (redis) {
@@ -31,18 +30,15 @@ async function getHistory(coreId, sessionId) {
   return RAM.get(key) || [];
 }
 
-// ===== Append to history instead of overwriting =====
-async function appendHistory(coreId, sessionId, newMessages) {
+async function setHistory(coreId, sessionId, history) {
   const key = histKey(coreId, sessionId);
-  let history = await getHistory(coreId, sessionId);
-  history = [...history, ...newMessages].slice(-HISTORY_MAX);
-  const payload = JSON.stringify(history);
+  const trimmed = Array.isArray(history) ? history.slice(-HISTORY_MAX) : [];
+  const payload = JSON.stringify(trimmed);
   if (redis) {
     await redis.set(key, payload, { ex: TTL_SECONDS });
   } else {
-    RAM.set(key, history);
+    RAM.set(key, trimmed);
   }
-  return history;
 }
 
 function uuid() {
@@ -81,7 +77,10 @@ app.post('/v1/complete', async (req, reply) => {
     // 1) load history
     const history = await getHistory(core_id, sid);
 
-    // 2) system prompt (core + language discipline)
+    // 2) add new user message to local history for sending to Anthropic
+    const messages = [...history, { role: 'user', content: prompt }].slice(-HISTORY_MAX);
+
+    // 3) system prompt
     const languageDiscipline = [
       `Language Discipline:`,
       `• Respond only in the user's language: ${locale}.`,
@@ -89,11 +88,7 @@ app.post('/v1/complete', async (req, reply) => {
       `• Do not mix languages in a single reply.`,
       `• No hallucinations — if unknown: "Unknown with current data."`
     ].join('\n');
-
     const system = [CORE, languageDiscipline].filter(Boolean).join('\n\n');
-
-    // 3) compose messages
-    const messages = [...history, { role: 'user', content: prompt }].slice(-HISTORY_MAX);
 
     // 4) call Anthropic
     const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -117,11 +112,9 @@ app.post('/v1/complete', async (req, reply) => {
       : (data?.content?.text ?? '');
     const assistantReply = (text || '').trim();
 
-    // 5) persist history by appending
-    const newHistory = await appendHistory(core_id, sid, [
-      { role: 'user', content: prompt },
-      { role: 'assistant', content: assistantReply }
-    ]);
+    // 5) persist updated history (append, not overwrite)
+    const newHistory = [...history, { role: 'user', content: prompt }, { role: 'assistant', content: assistantReply }];
+    await setHistory(core_id, sid, newHistory);
 
     return reply.send({
       ok: true,
