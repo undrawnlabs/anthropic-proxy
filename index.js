@@ -1,8 +1,6 @@
-// index.js — final, aligned with updated CORE_SYSTEM_PROMPT
+// index.js — final, multilingual memory via STATE + budgeted context
 // Fastify + Upstash Redis + Anthropic Messages API
-// Memory model: STB (short-term buffer) + LTM (archive) + Summary + Targeted recall
-// Economy: token budget + safe trimming (no full reread of 400+ turns)
-// Node 18.x
+// Node 18+
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -15,8 +13,8 @@ const {
   UPSTASH_REDIS_REST_URL,
   UPSTASH_REDIS_REST_TOKEN,
   CORE_SYSTEM_PROMPT,
-  SYSTEM_PROMPT_BASE: SP_FALLBACK, // optional fallback
-  OPENAI_API_KEY,                  // optional (improves recall quality)
+  SYSTEM_PROMPT_BASE: SP_FALLBACK,
+  OPENAI_API_KEY,                      // optional (for semantic recall)
   PORT = 3000,
   ANTHROPIC_MODEL = 'claude-3-5-sonnet-20240620',
   ROUTE_PREFIX = '',
@@ -38,18 +36,18 @@ await app.register(cors, { origin: true });
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
 
 // ---------- Tunables ----------
-const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30;                     // 30 days
-const STB_MAX_ITEMS = Number(STB_ENV || 20);                        // ~10 turns (user+assistant counted separately)
-const RECALL_TOP_K = Number(RECALL_ENV || 6);                       // retrieved LTM items
-const LTM_SCAN_LIMIT = Number(LTM_ENV || 1500);                     // tail window for recall scan
-const TOKEN_BUDGET = Number(BUDGET_ENV || 170_000);                 // headroom under ~200k context
+const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30;            // 30 days
+const STB_MAX_ITEMS = Number(STB_ENV || 20);              // ~10 turns (user+assistant)
+const RECALL_TOP_K = Number(RECALL_ENV || 6);
+const LTM_SCAN_LIMIT = Number(LTM_ENV || 1500);
+const TOKEN_BUDGET = Number(BUDGET_ENV || 170_000);
 const MAX_OUTPUT_TOKENS = Number(OUT_ENV || 1024);
 const TEMPERATURE = Number(ANTHROPIC_TEMPERATURE);
 
 // ---------- Redis Keys ----------
 const keySTB = (coreId, sessionId) => `stb:${coreId}:${sessionId}`; // LIST
 const keyLTM = (coreId, sessionId) => `ltm:${coreId}:${sessionId}`; // LIST
-const keySUM = (coreId, sessionId) => `sum:${coreId}:${sessionId}`; // STRING
+const keySUM = (coreId, sessionId) => `sum:${coreId}:${sessionId}`; // STRING (text facts)
 
 // ---------- Helpers ----------
 const toAnthropicMessage = (item) => ({
@@ -62,7 +60,7 @@ async function ensureListKey(client, key) {
   if (t && t !== 'none' && t !== 'list') await client.del(key);
 }
 
-// IMPORTANT: push each entry as a separate Redis list item (no arrays-in-one-slot)
+// push each entry as its own list item
 async function appendList(client, key, ...entries) {
   if (!entries.length) return;
   await ensureListKey(client, key);
@@ -71,7 +69,7 @@ async function appendList(client, key, ...entries) {
   await client.expire(key, HISTORY_TTL_SECONDS);
 }
 
-// Backward-compatible reader: flattens old broken shape if any
+// reader with backward-compat for old broken shape (arrays of strings)
 async function lrangeJSON(client, key, start, stop) {
   await ensureListKey(client, key);
   const raw = await client.lrange(key, start, stop);
@@ -81,14 +79,11 @@ async function lrangeJSON(client, key, start, stop) {
     if (v == null) continue;
     if (Array.isArray(v)) {
       for (const inner of v) {
-        try {
-          const obj = typeof inner === 'string' ? JSON.parse(inner) : inner;
+        try { const obj = typeof inner === 'string' ? JSON.parse(inner) : inner;
           if (obj && typeof obj === 'object') out.push(obj);
         } catch {}
       }
-    } else if (typeof v === 'object') {
-      out.push(v);
-    }
+    } else if (typeof v === 'object') out.push(v);
   }
   return out;
 }
@@ -107,7 +102,45 @@ async function writeSummary(client, key, text) {
   await client.expire(key, HISTORY_TTL_SECONDS);
 }
 
-// ---------- Embeddings (optional) ----------
+// ---------- STATE parser (language-agnostic) ----------
+function extractState(assistantText) {
+  if (!assistantText) return null;
+  const m = String(assistantText).match(/STATE:\s*({[\s\S]*})\s*$/);
+  if (!m) return null;
+  try {
+    const obj = JSON.parse(m[1]);
+    if (obj && typeof obj === 'object') return obj;
+  } catch {}
+  return null;
+}
+
+// store facts as simple "- key: value" lines
+function mergeFactsIntoSummary(prevSummary, factsObj) {
+  const map = new Map();
+  const lines = String(prevSummary || '')
+    .split('\n')
+    .map(s => s.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    const m = line.match(/^-+\s*([a-z0-9_]+)\s*:\s*(.+)$/i);
+    if (m) map.set(m[1].toLowerCase(), m[2]);
+  }
+  if (factsObj && typeof factsObj === 'object') {
+    for (const [k, v] of Object.entries(factsObj)) {
+      const key = String(k).toLowerCase().replace(/\s+/g, '_');
+      const val = String(v).trim();
+      if (key && val) map.set(key, val);
+    }
+  }
+  const head = 'Memory state (concise facts from earlier context):';
+  const body = Array.from(map.entries())
+    .slice(0, 100)
+    .map(([k, v]) => `- ${k}: ${v}`)
+    .join('\n');
+  return `${head}\n${body}`.slice(0, 2000);
+}
+
+// ---------- Embeddings (optional, for recall) ----------
 async function embedText(text) {
   if (!OPENAI_API_KEY) return null;
   const res = await fetch('https://api.openai.com/v1/embeddings', {
@@ -143,44 +176,7 @@ async function countTokens({ system, messages, model }) {
   return data.input_tokens ?? 0;
 }
 
-// ---- Summary builder (heuristic) ----
-function updateSummaryHeuristic(prevSummary, entries) {
-  const facts = [];
-  const add = (line) => {
-    const t = String(line || '').trim();
-    if (!t) return;
-    const item = `- ${t}`;
-    if (!facts.includes(item)) facts.push(item);
-  };
-
-  // Simple multilingual patterns: EN + UA + RU (first-person, preferences, location)
-  const tests = [
-    // EN
-    (s) => /(^i\s*(am|work|live|prefer|use)\b)|(\bmy\s+[a-z]+)/i.test(s),
-    // UA
-    (s) => /(^я\s*(живу|переїхав|працюю|користуюсь|використовую|люблю|віддаю\s*перевагу)\b)|\b(мій|моя|моє|мої)\b/i.test(s),
-    // RU
-    (s) => /(^я\s*(живу|переехал|работаю|пользуюсь|использую|люблю|предпочитаю)\b)|\b(мой|моя|моё|мои)\b/i.test(s),
-  ];
-
-  for (const e of entries) {
-    if (e.role !== 'user') continue;
-    const text = String(e.content || '');
-    // split by sentence-ish boundaries
-    const parts = text.split(/[.\n!?]+/).map(x => x.trim()).filter(Boolean).slice(0, 6);
-    for (const p of parts) {
-      if (tests.some(fn => fn(p))) add(p);
-    }
-  }
-
-  const head = `Memory state (concise facts from earlier context):`;
-  const base = prevSummary ? prevSummary.trim() : `${head}\n- (none yet)`;
-  const merged = facts.length ? `${base}\n# New observations:\n${facts.join('\n')}` : base;
-  return merged.slice(0, 1600);
-}
-}
-
-// ---------- Recall from LTM ----------
+// ---------- LTM recall ----------
 async function recallFromLTM(coreId, sessionId, userMsg) {
   const all = await lrangeJSON(redis, keyLTM(coreId, sessionId), -LTM_SCAN_LIMIT, -1);
   if (!all.length) return [];
@@ -205,6 +201,7 @@ async function buildPrompt({ coreId, sessionId, locale, userEntry }) {
 
   const summaryBlock = summary ? `\n\n${summary}` : '';
   const recalledBlock = recalled.length ? `\n\nRelevant context (retrieved):\n${recalled.map(e => `- ${e.role}: ${e.content}`).join('\n')}` : '';
+
   let system = `${SYSTEM_PROMPT_BASE}\nLocale: ${locale}${summaryBlock}${recalledBlock}`;
   let messages = [...stb.map(toAnthropicMessage), toAnthropicMessage(userEntry)];
 
@@ -252,10 +249,12 @@ async function rolloverSTBIfNeeded(coreId, sessionId) {
   await appendList(redis, keyLTM(coreId, sessionId), ...enriched);
 }
 
-// ---------- Summary maintenance ----------
-async function maybeRefreshSummary(coreId, sessionId, recentEntries) {
+// ---------- Summary maintenance from STATE ----------
+async function maybeRefreshSummary(coreId, sessionId, assistantText) {
+  const state = extractState(assistantText);
+  if (!state || !state.facts || typeof state.facts !== 'object') return;
   const prev = await readSummary(redis, keySUM(coreId, sessionId));
-  const next = updateSummaryHeuristic(prev, recentEntries);
+  const next = mergeFactsIntoSummary(prev, state.facts);
   if (next !== prev) await writeSummary(redis, keySUM(coreId, sessionId), next);
 }
 
@@ -283,14 +282,15 @@ const chatHandler = async (req, reply) => {
   }
 
   const data = await res.json();
-  const assistantText = Array.isArray(data.content) && data.content[0]?.type === 'text' ? data.content[0].text : '';
+  const assistantText =
+    Array.isArray(data.content) && data.content[0]?.type === 'text' ? data.content[0].text : '';
   const assistantEntry = { role: 'assistant', content: assistantText, ts: Date.now(), locale };
 
-  // Append BOTH user and assistant to STB (two separate list items)
+  // persist
   await appendList(redis, keySTB(core_id, session_id), userEntry, assistantEntry);
   await ltrimKeepLast(redis, keySTB(core_id, session_id), STB_MAX_ITEMS);
   await rolloverSTBIfNeeded(core_id, session_id);
-  await maybeRefreshSummary(core_id, session_id, [userEntry, assistantEntry]);
+  await maybeRefreshSummary(core_id, session_id, assistantText);
 
   return reply.send({ core_id, session_id, locale, reply: assistantText });
 };
@@ -306,14 +306,12 @@ app.get(`${r}/debug/tokens`, async (req) => {
   return { input_tokens: tokens, system_chars: system.length, messages_count: messages.length };
 });
 app.post(`${r}/chat`, chatHandler);
-
-// Legacy aliases (to keep old clients working)
+// Legacy aliases
 app.post(`${r}/v1/chat`, chatHandler);
 app.post(`${r}/complete`, chatHandler);
 app.post(`${r}/v1/complete`, chatHandler);
 app.post(`${r}/api/chat`, chatHandler);
-
-// Admin: purge a session (for clean tests)
+// Admin
 app.post(`${r}/purge`, async (req, reply) => {
   const { core_id, session_id } = req.body || {};
   if (!core_id || !session_id) return reply.code(400).send({ error: 'bad_request', detail: 'core_id and session_id required' });
@@ -323,7 +321,7 @@ app.post(`${r}/purge`, async (req, reply) => {
   return reply.send({ ok: true });
 });
 
-// Startup logs
+// startup
 app.ready().then(() => app.log.info(app.printRoutes()));
 app.listen({ port: Number(PORT), host: '0.0.0.0' })
   .then(addr => app.log.info(`listening on ${addr}`))
