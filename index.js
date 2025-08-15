@@ -1,5 +1,5 @@
 // index.js — Render + Upstash Redis + Anthropic Messages API
-// Memory per user/core/session. NO AUTH (open), for testing only.
+// Single-user persistent memory (core_id + session_id)
 
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
@@ -8,20 +8,20 @@ import { Redis } from '@upstash/redis';
 
 // ===== Config =====
 const PORT = process.env.PORT || 10000;
-const TTL_SECONDS = 60 * 60 * 24 * 30;                    // 30 days
+const TTL_SECONDS = 60 * 60 * 24 * 30;                 // 30 days
 const HISTORY_MAX = parseInt(process.env.HISTORY_MAX_MESSAGES || '400', 10);
-const CORE = (process.env.CORE_SYSTEM_PROMPT || '').trim(); // optional system/core prompt
+const CORE = (process.env.CORE_SYSTEM_PROMPT || '').trim();
 
 // ===== Redis (with RAM fallback) =====
 const redis = (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN)
   ? new Redis({ url: process.env.UPSTASH_REDIS_REST_URL, token: process.env.UPSTASH_REDIS_REST_TOKEN })
   : null;
 
-const RAM = new Map(); // fallback only if Redis absent
-const histKey = (userId, coreId, sessionId) => `hist:${userId}:${coreId || 'exec'}:${sessionId}`;
+const RAM = new Map();
+const histKey = (coreId, sessionId) => `hist:${coreId || 'exec'}:${sessionId}`;
 
-async function getHistory(userId, coreId, sessionId) {
-  const key = histKey(userId, coreId, sessionId);
+async function getHistory(coreId, sessionId) {
+  const key = histKey(coreId, sessionId);
   if (redis) {
     const raw = await redis.get(key);
     if (!raw) return [];
@@ -30,15 +30,12 @@ async function getHistory(userId, coreId, sessionId) {
   return RAM.get(key) || [];
 }
 
-async function setHistory(userId, coreId, sessionId, history) {
-  const key = histKey(userId, coreId, sessionId);
+async function setHistory(coreId, sessionId, history) {
+  const key = histKey(coreId, sessionId);
   const trimmed = Array.isArray(history) ? history.slice(-HISTORY_MAX) : [];
   const payload = JSON.stringify(trimmed);
-  if (redis) {
-    await redis.set(key, payload, { ex: TTL_SECONDS });
-  } else {
-    RAM.set(key, trimmed);
-  }
+  if (redis) await redis.set(key, payload, { ex: TTL_SECONDS });
+  else RAM.set(key, trimmed);
 }
 
 function uuid() {
@@ -52,28 +49,23 @@ function uuid() {
 const app = Fastify({ logger: true });
 await app.register(cors, { origin: '*' });
 
-// ---- Health (public)
-app.get('/health', async () => ({ ok:true, service:'undrawn-core', redis: !!redis }));
+// Health
+app.get('/health', async () => ({ ok: true, redis: !!redis, history_cap: HISTORY_MAX }));
 
 /**
  * POST /v1/complete
- * Headers (optional):
- *   X-User-Id: <string>     // для розділення пам'яті між користувачами; якщо нема — "anon"
- *
  * Body:
  * {
- *   "core_id": "exec",                         // опц.; ізолює пам'ять по інструментам
- *   "session_id": "s1",                        // опц.; якщо нема — згенеруємо
+ *   "core_id": "exec",                       // optional; isolates memory per tool
+ *   "session_id": "perm-1",                  // optional; generated if missing
  *   "model": "claude-3-7-sonnet-20250219",
  *   "prompt": "text",
- *   "locale": "uk",                            // опц.; дисципліна мови
- *   "max_tokens": 500                          // опц.
+ *   "locale": "uk",                          // optional
+ *   "max_tokens": 500                        // optional
  * }
  */
 app.post('/v1/complete', async (req, reply) => {
   try {
-    const userId = req.headers['x-user-id'] ? String(req.headers['x-user-id']) : 'anon';
-
     const {
       core_id = 'exec',
       session_id,
@@ -89,7 +81,7 @@ app.post('/v1/complete', async (req, reply) => {
     const sid = session_id || uuid();
 
     // 1) load history
-    const history = await getHistory(userId, core_id, sid);
+    const history = await getHistory(core_id, sid);
 
     // 2) system prompt (core + language discipline)
     const languageDiscipline = [
@@ -102,8 +94,8 @@ app.post('/v1/complete', async (req, reply) => {
 
     const system = [CORE, languageDiscipline].filter(Boolean).join('\n\n');
 
-    // 3) compose messages (trim to cap)
-    const messages = [...history, { role:'user', content: prompt }].slice(-HISTORY_MAX);
+    // 3) compose messages
+    const messages = [...history, { role: 'user', content: prompt }].slice(-HISTORY_MAX);
 
     // 4) call Anthropic
     const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -130,16 +122,15 @@ app.post('/v1/complete', async (req, reply) => {
     // 5) persist history
     const newHistory = [
       ...history,
-      { role:'user',      content: prompt },
-      { role:'assistant', content: assistantReply }
+      { role: 'user',      content: prompt },
+      { role: 'assistant', content: assistantReply }
     ];
-    await setHistory(userId, core_id, sid, newHistory);
+    await setHistory(core_id, sid, newHistory);
 
     return reply.send({
       ok: true,
       content: assistantReply,
       meta: {
-        user_id: userId,
         core_id,
         session_id: sid,
         history_messages: newHistory.length,
@@ -151,6 +142,23 @@ app.post('/v1/complete', async (req, reply) => {
     req.log.error(err);
     return reply.code(500).send({ ok:false, error:'server_error' });
   }
+});
+
+// Inspect history length
+app.get('/v1/history/len', async (req, reply) => {
+  const { core_id = 'exec', session_id } = req.query || {};
+  if (!session_id) return reply.code(400).send({ ok:false, error:'session_id_required' });
+  const h = await getHistory(core_id, session_id);
+  return reply.send({ ok:true, messages: Array.isArray(h) ? h.length : 0, cap: HISTORY_MAX });
+});
+
+// Clear history
+app.delete('/v1/history', async (req, reply) => {
+  const { core_id = 'exec', session_id } = req.query || {};
+  if (!session_id) return reply.code(400).send({ ok:false, error:'session_id_required' });
+  const key = histKey(core_id, session_id);
+  if (redis) await redis.del(key); else RAM.delete(key);
+  return reply.send({ ok:true, cleared: true });
 });
 
 // Start
