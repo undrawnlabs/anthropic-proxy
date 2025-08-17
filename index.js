@@ -1,327 +1,209 @@
-// index.js — final, multilingual memory via STATE + budgeted context
-// Fastify + Upstash Redis + Anthropic Messages API
-
-import Fastify from 'fastify';
-import cors from '@fastify/cors';
-import fetch from 'node-fetch';
-import { Redis } from '@upstash/redis';
+// index.js
+import Fastify from "fastify";
+import cors from "@fastify/cors";
+import Redis from "ioredis";
+import fetch from "node-fetch";
 
 // ---------- ENV ----------
 const {
+  REDIS_URL,
   ANTHROPIC_API_KEY,
-  UPSTASH_REDIS_REST_URL,
-  UPSTASH_REDIS_REST_TOKEN,
-  CORE_SYSTEM_PROMPT,
-  SYSTEM_PROMPT_BASE: SP_FALLBACK,
-  OPENAI_API_KEY,                      // optional (for semantic recall)
   PORT = 3000,
-  ANTHROPIC_MODEL = 'claude-3-5-sonnet-20240620',
-  ROUTE_PREFIX = '',
-  ANTHROPIC_TEMPERATURE = '0.2',
-  STB_MAX_ITEMS: STB_ENV,
-  RECALL_TOP_K: RECALL_ENV,
-  LTM_SCAN_LIMIT: LTM_ENV,
-  TOKEN_BUDGET: BUDGET_ENV,
-  MAX_OUTPUT_TOKENS: OUT_ENV,
+  HOST = "0.0.0.0",
+
+  // Tunables (safe defaults)
+  ANTHROPIC_MODEL = "claude-3-opus-20240229",
+  SUMMARIZER_MODEL = "claude-3-haiku-20240307",
+  MAX_OUTPUT_TOKENS = "800",
+  TEMPERATURE = "0.2",
+  TIMEOUT_MS = "20000",
+  HISTORY_KEEP = "20",            // how many recent messages to send to Claude
+  SUMMARIZE_THRESHOLD = "200",    // when total messages exceed this, auto-summarize older part
+  SUMMARY_MAX_TOKENS = "400"
 } = process.env;
 
-const SYSTEM_PROMPT_BASE = CORE_SYSTEM_PROMPT || SP_FALLBACK;
-if (!ANTHROPIC_API_KEY || !UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN || !SYSTEM_PROMPT_BASE) {
-  throw new Error('Missing ENV: ANTHROPIC_API_KEY, UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN, CORE_SYSTEM_PROMPT (or SYSTEM_PROMPT_BASE)');
-}
+if (!REDIS_URL) throw new Error("Missing REDIS_URL");
+if (!ANTHROPIC_API_KEY) throw new Error("Missing ANTHROPIC_API_KEY");
 
+// ---------- SERVER ----------
 const app = Fastify({ logger: true });
-await app.register(cors, { origin: true });
-const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
+app.register(cors, { origin: true });
 
-// ---------- Tunables ----------
-const HISTORY_TTL_SECONDS = 60 * 60 * 24 * 30;            // 30 days
-const STB_MAX_ITEMS = Number(STB_ENV || 20);              // ~10 turns (user+assistant)
-const RECALL_TOP_K = Number(RECALL_ENV || 6);
-const LTM_SCAN_LIMIT = Number(LTM_ENV || 1500);
-const TOKEN_BUDGET = Number(BUDGET_ENV || 170_000);
-const MAX_OUTPUT_TOKENS = Number(OUT_ENV || 1024);
-const TEMPERATURE = Number(ANTHROPIC_TEMPERATURE);
+// ---------- REDIS ----------
+const redis = new Redis(REDIS_URL, { tls: { rejectUnauthorized: false } });
 
-// ---------- Redis Keys ----------
-const keySTB = (coreId, sessionId) => `stb:${coreId}:${sessionId}`; // LIST
-const keyLTM = (coreId, sessionId) => `ltm:${coreId}:${sessionId}`; // LIST
-const keySUM = (coreId, sessionId) => `sum:${coreId}:${sessionId}`; // STRING (text facts)
+// ---------- HELPERS ----------
+function parseNumber(v, def) { const n = Number(v); return Number.isFinite(n) ? n : def; }
 
-// ---------- Helpers ----------
-const toAnthropicMessage = (item) => ({
-  role: item.role === 'assistant' ? 'assistant' : 'user',
-  content: [{ type: 'text', text: String(item.content ?? '') }],
-});
-
-async function ensureListKey(client, key) {
-  const t = await client.type(key);
-  if (t && t !== 'none' && t !== 'list') await client.del(key);
-}
-
-// push each entry as its own list item
-async function appendList(client, key, ...entries) {
-  if (!entries.length) return;
-  await ensureListKey(client, key);
-  const payloads = entries.map((e) => JSON.stringify(e));
-  await client.rpush(key, ...payloads);
-  await client.expire(key, HISTORY_TTL_SECONDS);
-}
-
-// reader with backward-compat for old broken shape (arrays of strings)
-async function lrangeJSON(client, key, start, stop) {
-  await ensureListKey(client, key);
-  const raw = await client.lrange(key, start, stop);
-  const out = [];
-  for (const s of raw) {
-    let v; try { v = JSON.parse(s); } catch { v = null; }
-    if (v == null) continue;
-    if (Array.isArray(v)) {
-      for (const inner of v) {
-        try { const obj = typeof inner === 'string' ? JSON.parse(inner) : inner;
-          if (obj && typeof obj === 'object') out.push(obj);
-        } catch {}
-      }
-    } else if (typeof v === 'object') out.push(v);
-  }
-  return out;
-}
-
-async function ltrimKeepLast(client, key, maxItems) {
-  await ensureListKey(client, key);
-  await client.ltrim(key, -maxItems, -1);
-  await client.expire(key, HISTORY_TTL_SECONDS);
-}
-async function readSummary(client, key) {
-  const v = await client.get(key);
-  return typeof v === 'string' ? v : '';
-}
-async function writeSummary(client, key, text) {
-  await client.set(key, text || '');
-  await client.expire(key, HISTORY_TTL_SECONDS);
-}
-
-// ---------- STATE parser (language-agnostic) ----------
-function extractState(assistantText) {
-  if (!assistantText) return null;
-  const m = String(assistantText).match(/STATE:\s*({[\s\S]*})\s*$/);
-  if (!m) return null;
+async function callAnthropic({ model, system, messages, maxTokens, temperature, timeoutMs }) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  const payload = {
+    model,
+    system,
+    messages,
+    max_tokens: maxTokens,
+    temperature
+  };
   try {
-    const obj = JSON.parse(m[1]);
-    if (obj && typeof obj === 'object') return obj;
-  } catch {}
-  return null;
-}
-
-// store facts as simple "- key: value" lines
-function mergeFactsIntoSummary(prevSummary, factsObj) {
-  const map = new Map();
-  const lines = String(prevSummary || '')
-    .split('\n')
-    .map(s => s.trim())
-    .filter(Boolean);
-  for (const line of lines) {
-    const m = line.match(/^-+\s*([a-z0-9_]+)\s*:\s*(.+)$/i);
-    if (m) map.set(m[1].toLowerCase(), m[2]);
-  }
-  if (factsObj && typeof factsObj === 'object') {
-    for (const [k, v] of Object.entries(factsObj)) {
-      const key = String(k).toLowerCase().replace(/\s+/g, '_');
-      const val = String(v).trim();
-      if (key && val) map.set(key, val);
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Anthropic HTTP ${res.status}: ${text}`);
     }
-  }
-  const head = 'Memory state (concise facts from earlier context):';
-  const body = Array.from(map.entries())
-    .slice(0, 100)
-    .map(([k, v]) => `- ${k}: ${v}`)
-    .join('\n');
-  return `${head}\n${body}`.slice(0, 2000);
-}
-
-// ---------- Embeddings (optional, for recall) ----------
-async function embedText(text) {
-  if (!OPENAI_API_KEY) return null;
-  const res = await fetch('https://api.openai.com/v1/embeddings', {
-    method: 'POST',
-    headers: { authorization: `Bearer ${OPENAI_API_KEY}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ model: 'text-embedding-3-small', input: text }),
-  });
-  if (!res.ok) { const err = await res.text().catch(() => ''); throw new Error(`OpenAI embeddings error: ${res.status} ${err}`); }
-  const data = await res.json();
-  return data.data?.[0]?.embedding || null;
-}
-function cosineSim(a, b) {
-  let dot = 0, na = 0, nb = 0; const n = Math.min(a.length, b.length);
-  for (let i = 0; i < n; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-12);
-}
-function keywordScore(q, doc) {
-  const qT = new Set(String(q).toLowerCase().split(/\W+/).filter(Boolean));
-  const dT = new Set(String(doc).toLowerCase().split(/\W+/).filter(Boolean));
-  let inter = 0; for (const t of qT) if (dT.has(t)) inter++;
-  return inter / Math.sqrt((qT.size || 1) * (dT.size || 1));
-}
-
-// ---------- Token counting ----------
-async function countTokens({ system, messages, model }) {
-  const res = await fetch('https://api.anthropic.com/v1/messages/count_tokens', {
-    method: 'POST',
-    headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model, system, messages }),
-  });
-  if (!res.ok) { const txt = await res.text().catch(() => ''); throw new Error(`count_tokens failed: ${res.status} ${txt}`); }
-  const data = await res.json();
-  return data.input_tokens ?? 0;
-}
-
-// ---------- LTM recall ----------
-async function recallFromLTM(coreId, sessionId, userMsg) {
-  const all = await lrangeJSON(redis, keyLTM(coreId, sessionId), -LTM_SCAN_LIMIT, -1);
-  if (!all.length) return [];
-  let qEmb = null;
-  if (OPENAI_API_KEY) { try { qEmb = await embedText(userMsg); } catch {} }
-  const scored = all.map((e) => {
-    const content = String(e.content || '');
-    const score = (qEmb && Array.isArray(e.emb)) ? cosineSim(qEmb, e.emb) : keywordScore(userMsg, content);
-    return { score, entry: e };
-  }).sort((a, b) => b.score - a.score);
-  const top = scored.slice(0, RECALL_TOP_K).map(s => s.entry);
-  const seen = new Set(); const dedup = [];
-  for (const e of top) { const k = `${e.role}:${e.content.slice(0, 120)}`; if (!seen.has(k)) { seen.add(k); dedup.push(e); } }
-  return dedup;
-}
-
-// ---------- Build prompt under budget ----------
-async function buildPrompt({ coreId, sessionId, locale, userEntry }) {
-  const stb = await lrangeJSON(redis, keySTB(coreId, sessionId), 0, -1);
-  const summary = await readSummary(redis, keySUM(coreId, sessionId));
-  const recalled = await recallFromLTM(coreId, sessionId, userEntry.content);
-
-  const summaryBlock = summary ? `\n\n${summary}` : '';
-  const recalledBlock = recalled.length ? `\n\nRelevant context (retrieved):\n${recalled.map(e => `- ${e.role}: ${e.content}`).join('\n')}` : '';
-
-  let system = `${SYSTEM_PROMPT_BASE}\nLocale: ${locale}${summaryBlock}${recalledBlock}`;
-  let messages = [...stb.map(toAnthropicMessage), toAnthropicMessage(userEntry)];
-
-  let tokens = await countTokens({ system, messages, model: ANTHROPIC_MODEL });
-  if (tokens + MAX_OUTPUT_TOKENS <= TOKEN_BUDGET) return { system, messages };
-
-  // Trim STB oldest-first
-  const work = [...stb];
-  while (work.length > 0) {
-    work.shift();
-    messages = [...work.map(toAnthropicMessage), toAnthropicMessage(userEntry)];
-    tokens = await countTokens({ system, messages, model: ANTHROPIC_MODEL });
-    if (tokens + MAX_OUTPUT_TOKENS <= TOKEN_BUDGET) break;
-  }
-  // Drop recalled, then summary if still too big
-  if (tokens + MAX_OUTPUT_TOKENS > TOKEN_BUDGET && recalledBlock) {
-    system = `${SYSTEM_PROMPT_BASE}\nLocale: ${locale}${summaryBlock}`;
-    tokens = await countTokens({ system, messages, model: ANTHROPIC_MODEL });
-  }
-  if (tokens + MAX_OUTPUT_TOKENS > TOKEN_BUDGET && summaryBlock) {
-    system = `${SYSTEM_PROMPT_BASE}\nLocale: ${locale}`;
-  }
-  return { system, messages };
-}
-
-// ---------- STB → LTM rollover ----------
-async function rolloverSTBIfNeeded(coreId, sessionId) {
-  const k = keySTB(coreId, sessionId);
-  await ensureListKey(redis, k);
-  const len = await redis.llen(k);
-  if (len <= STB_MAX_ITEMS) return;
-
-  const excess = len - STB_MAX_ITEMS;
-  const toMove = await lrangeJSON(redis, k, 0, excess - 1);
-  await ltrimKeepLast(redis, k, STB_MAX_ITEMS);
-
-  const enriched = [];
-  for (const e of toMove) {
-    const item = { ...e };
-    if (OPENAI_API_KEY) {
-      try { const emb = await embedText(String(e.content || '')); if (emb) item.emb = emb; } catch {}
+    return await res.json();
+  } catch (err) {
+    // single retry (cold starts / transient network)
+    try {
+      const res2 = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "x-api-key": ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          model, system, messages,
+          max_tokens: maxTokens,
+          temperature
+        })
+      });
+      if (!res2.ok) {
+        const text = await res2.text().catch(() => "");
+        throw new Error(`Anthropic retry HTTP ${res2.status}: ${text}`);
+      }
+      return await res2.json();
+    } finally {
+      clearTimeout(t);
     }
-    enriched.push(item);
+  } finally {
+    clearTimeout(t);
   }
-  await appendList(redis, keyLTM(coreId, sessionId), ...enriched);
 }
 
-// ---------- Summary maintenance from STATE ----------
-async function maybeRefreshSummary(coreId, sessionId, assistantText) {
-  const state = extractState(assistantText);
-  if (!state || !state.facts || typeof state.facts !== 'object') return;
-  const prev = await readSummary(redis, keySUM(coreId, sessionId));
-  const next = mergeFactsIntoSummary(prev, state.facts);
-  if (next !== prev) await writeSummary(redis, keySUM(coreId, sessionId), next);
+function buildSystemPrompt(locale) {
+  return [
+    "You are undrawn Core.",
+    "Use the provided memory summary and the recent message history as ground truth.",
+    "Do not re-ask facts unless they conflict.",
+    `Reply in the user's language (locale hint: ${locale || "auto"}).`
+  ].join(" ");
 }
 
-// ---------- Core handler ----------
-const chatHandler = async (req, reply) => {
-  const b = req.body || {};
-  const { core_id, session_id, user_message, prompt, locale = 'uk' } = b;
-  const content = user_message ?? prompt;
-  if (!core_id || !session_id || !content) {
-    return reply.code(400).send({ error: 'bad_request', detail: 'core_id, session_id, and user_message/prompt are required' });
+// ---------- ROUTES ----------
+app.get("/health", async () => ({ ok: true }));
+
+app.post("/v1/complete", async (req, reply) => {
+  try {
+    const { core_id, session_id, prompt, locale } = req.body || {};
+    if (!core_id || !session_id || !prompt) {
+      return reply.code(400).send({ error: "Missing core_id, session_id or prompt" });
+    }
+
+    const histKey = `hist:${core_id}:${session_id}`;
+    const sumKey  = `sum:${core_id}:${session_id}`;
+
+    // 1) Load compact recent history (economy)
+    const keepN = parseNumber(HISTORY_KEEP, 20);
+    const recent = await redis.lrange(histKey, -keepN, -1);
+    const recentMsgs = recent.map(x => JSON.parse(x)); // [{role, content}, ...]
+
+    // 2) Load stored summary (long-term memory)
+    const summary = await redis.get(sumKey);
+    const messages = [];
+
+    if (summary) {
+      messages.push({
+        role: "system",
+        content: `Memory Summary (treat as true context): ${summary}`
+      });
+    }
+
+    // 3) Append recent dialogue and the new user message
+    if (recentMsgs.length) messages.push(...recentMsgs);
+    messages.push({ role: "user", content: prompt });
+
+    // 4) Call Claude for main reply
+    const main = await callAnthropic({
+      model: ANTHROPIC_MODEL,
+      system: buildSystemPrompt(locale),
+      messages,
+      maxTokens: parseNumber(MAX_OUTPUT_TOKENS, 800),
+      temperature: parseNumber(TEMPERATURE, 0.2),
+      timeoutMs: parseNumber(TIMEOUT_MS, 20000)
+    });
+
+    const modelReply = main?.content?.[0]?.text;
+    if (!modelReply) throw new Error("Invalid response from Claude");
+
+    // 5) Persist messages (append)
+    await redis.rpush(histKey, JSON.stringify({ role: "user", content: prompt }));
+    await redis.rpush(histKey, JSON.stringify({ role: "assistant", content: modelReply }));
+
+    // 6) Expire keys (7 days rolling)
+    const ttl = 60 * 60 * 24 * 7;
+    await redis.expire(histKey, ttl);
+    await redis.expire(sumKey, ttl);
+
+    // 7) Auto-summarize older part when the thread grows
+    const totalLen = await redis.llen(histKey);
+    const threshold = parseNumber(SUMMARIZE_THRESHOLD, 200);
+
+    if (totalLen > threshold) {
+      // summarize ONLY the older slice; keep the most recent keepN untouched
+      const olderSlice = await redis.lrange(histKey, 0, -keepN - 1); // everything except the last keepN
+      if (olderSlice.length > 0) {
+        const olderPlain = olderSlice.map(x => JSON.parse(x)); // array of {role, content}
+
+        const sum = await callAnthropic({
+          model: SUMMARIZER_MODEL,
+          system: "Summarize the conversation into concise, durable facts and instructions. Preserve key decisions, preferences, identities, dates, and constraints.",
+          messages: [
+            { role: "user", content: JSON.stringify(olderPlain) }
+          ],
+          maxTokens: parseNumber(SUMMARY_MAX_TOKENS, 400),
+          temperature: 0,
+          timeoutMs: parseNumber(TIMEOUT_MS, 20000)
+        });
+
+        const newSummary = sum?.content?.[0]?.text || "";
+        if (newSummary) {
+          await redis.set(sumKey, newSummary);
+          // hard-trim history to last keepN after summarizing
+          const lastN = await redis.lrange(histKey, -keepN, -1);
+          await redis.del(histKey);
+          if (lastN.length) await redis.rpush(histKey, ...lastN);
+        }
+      }
+    }
+
+    // 8) Return API shape expected by Builder
+    return reply.send({ reply: modelReply });
+
+  } catch (err) {
+    req.log.error(err);
+    return reply.code(500).send({ error: "Internal Server Error" });
   }
-
-  const userEntry = { role: 'user', content, ts: Date.now(), locale };
-  const { system, messages } = await buildPrompt({ coreId: core_id, sessionId: session_id, locale, userEntry });
-
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: ANTHROPIC_MODEL, system, messages, max_tokens: MAX_OUTPUT_TOKENS, temperature: TEMPERATURE }),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    req.log.error({ status: res.status, body: text }, 'Anthropic API error');
-    return reply.code(502).send({ error: 'upstream_error', detail: text });
-  }
-
-  const data = await res.json();
-  const assistantText =
-    Array.isArray(data.content) && data.content[0]?.type === 'text' ? data.content[0].text : '';
-  const assistantEntry = { role: 'assistant', content: assistantText, ts: Date.now(), locale };
-
-  // persist
-  await appendList(redis, keySTB(core_id, session_id), userEntry, assistantEntry);
-  await ltrimKeepLast(redis, keySTB(core_id, session_id), STB_MAX_ITEMS);
-  await rolloverSTBIfNeeded(core_id, session_id);
-  await maybeRefreshSummary(core_id, session_id, assistantText);
-
-  return reply.send({ core_id, session_id, locale, reply: assistantText });
-};
-
-// ---------- Routes ----------
-const r = ROUTE_PREFIX;
-app.get(`${r}/health`, async () => ({ ok: true }));
-app.get(`${r}/debug/tokens`, async (req) => {
-  const { core_id, session_id, locale = 'uk', prompt = 'ping' } = req.query;
-  const ue = { role: 'user', content: String(prompt || ''), ts: Date.now(), locale };
-  const { system, messages } = await buildPrompt({ coreId: core_id, sessionId: session_id, locale, userEntry: ue });
-  const tokens = await countTokens({ system, messages, model: ANTHROPIC_MODEL });
-  return { input_tokens: tokens, system_chars: system.length, messages_count: messages.length };
-});
-app.post(`${r}/chat`, chatHandler);
-// Legacy aliases
-app.post(`${r}/v1/chat`, chatHandler);
-app.post(`${r}/complete`, chatHandler);
-app.post(`${r}/v1/complete`, chatHandler);
-app.post(`${r}/api/chat`, chatHandler);
-// Admin
-app.post(`${r}/purge`, async (req, reply) => {
-  const { core_id, session_id } = req.body || {};
-  if (!core_id || !session_id) return reply.code(400).send({ error: 'bad_request', detail: 'core_id and session_id required' });
-  await redis.del(keySTB(core_id, session_id));
-  await redis.del(keyLTM(core_id, session_id));
-  await redis.del(keySUM(core_id, session_id));
-  return reply.send({ ok: true });
 });
 
-// startup
-app.ready().then(() => app.log.info(app.printRoutes()));
-app.listen({ port: Number(PORT), host: '0.0.0.0' })
-  .then(addr => app.log.info(`listening on ${addr}`))
-  .catch(err => { app.log.error(err); process.exit(1); });
+app.addHook("onClose", async () => {
+  try { await redis.quit(); } catch {}
+});
+
+// ---------- BOOT ----------
+app.listen({ port: Number(PORT), host: HOST }, (err, address) => {
+  if (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+  app.log.info(`undrawn Core listening at ${address}`);
+});
