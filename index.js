@@ -43,13 +43,16 @@ const baseRules =
   "Use Memory Summary (if present) and recent history as ground truth. " +
   "Do not re-ask facts unless conflicting. Be concise.";
 
-const buildSystem = (locale) =>
+const buildSystem = (locale, memorySummary) =>
   [
     "You are undrawn Core.",
     baseRules,
+    memorySummary ? `Memory Summary: ${memorySummary}` : "",
     `Reply in the user's language (locale hint: ${locale || "auto"}).`,
     sanitize(CORE_SYSTEM_PROMPT)
-  ].filter(Boolean).join(" ");
+  ]
+    .filter(Boolean)
+    .join(" ");
 
 async function callAnthropic({ model, system, messages, maxTokens, temperature, timeoutMs }) {
   const controller = new AbortController();
@@ -65,8 +68,8 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
       },
       body: JSON.stringify({
         model,
-        system,
-        messages,
+        system,                   // <-- system prompt тут (НЕ в messages)
+        messages,                 // <-- тільки user/assistant
         max_tokens: maxTokens,
         temperature
       })
@@ -80,10 +83,21 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
 
 app.get("/health", async () => ({ ok: true }));
 
+// -------------------- FIXED HANDLER --------------------
 app.post("/v1/complete", async (req, reply) => {
   const t0 = Date.now();
   try {
-    const { core_id, session_id, prompt, locale } = req.body || {};
+    // НОРМАЛІЗАЦІЯ ТІЛА (без дубль-парсингу)
+    let body = req.body;
+    if (typeof body === "string") {
+      try { body = JSON.parse(body); }
+      catch { return reply.code(400).send({ error: "Invalid JSON body" }); }
+    }
+    if (!body || typeof body !== "object") {
+      return reply.code(400).send({ error: "Empty body" });
+    }
+
+    const { core_id, session_id, prompt, locale } = body;
     if (!core_id || !session_id || !prompt) {
       return reply.code(400).send({ error: "Missing core_id, session_id or prompt" });
     }
@@ -91,24 +105,29 @@ app.post("/v1/complete", async (req, reply) => {
     const histKey = `hist:${core_id}:${session_id}`;
     const sumKey  = `sum:${core_id}:${session_id}`;
 
+    // SAFE PARSE для Redis
+    const safeParse = (v) => {
+      if (typeof v === "string") { try { return JSON.parse(v); } catch { return null; } }
+      return v && typeof v === "object" ? v : null;
+    };
+
     // recent
     const keepN = num(HISTORY_KEEP, 10);
     const recent = await redis.lrange(histKey, -keepN, -1);
-    const recentMsgs = recent.map((s) => JSON.parse(s));
+    const recentMsgs = (recent || []).map(safeParse).filter(Boolean);
 
     // summary
     const summary = await redis.get(sumKey);
 
-    // assemble
+    // assemble messages (ЛИШЕ user/assistant)
     const messages = [];
-    if (summary) messages.push({ role: "system", content: `Memory Summary: ${summary}` });
     if (recentMsgs.length) messages.push(...recentMsgs);
     messages.push({ role: "user", content: String(prompt) });
 
     // main answer (fast)
     const res = await callAnthropic({
       model: ANTHROPIC_MODEL,
-      system: buildSystem(locale),
+      system: buildSystem(locale, summary),   // <-- summary в system prompt
       messages,
       maxTokens: num(MAX_OUTPUT_TOKENS, 300),
       temperature: num(TEMPERATURE, 0.2),
@@ -129,7 +148,7 @@ app.post("/v1/complete", async (req, reply) => {
     if (total > num(SUMMARIZE_THRESHOLD, 120)) {
       const older = await redis.lrange(histKey, 0, -keepN - 1);
       if (older.length) {
-        const olderPlain = older.map((s) => JSON.parse(s));
+        const olderPlain = (older || []).map(safeParse).filter(Boolean);
         const sum = await callAnthropic({
           model: SUMMARIZER_MODEL,
           system: "Summarize into compact, durable facts: identities, decisions, preferences, constraints, dates.",
@@ -162,6 +181,7 @@ app.post("/v1/complete", async (req, reply) => {
     return reply.code(500).send({ error: "Internal Server Error" });
   }
 });
+// ------------------ END FIXED HANDLER -------------------
 
 app.listen({ port: Number(process.env.PORT || 3000), host: "0.0.0.0" }, (err, address) => {
   if (err) { app.log.error(err); process.exit(1); }
