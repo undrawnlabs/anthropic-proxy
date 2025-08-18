@@ -34,7 +34,6 @@ if (!ANTHROPIC_API_KEY) throw new Error("Missing ANTHROPIC_API_KEY");
 
 const app = Fastify({ logger: true, bodyLimit: Number(BODY_LIMIT_BYTES) });
 app.register(cors, { origin: true });
-app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024, files: 1 } }); // не задіяно, але хай буде
 
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
 
