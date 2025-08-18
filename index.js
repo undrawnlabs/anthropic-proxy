@@ -1,4 +1,4 @@
-// index.js  — FAST profile for Builder (<9s)
+// index.js — FAST profile (fixed for long inputs & clear errors)
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { Redis } from "@upstash/redis";
@@ -9,23 +9,31 @@ const {
   UPSTASH_REDIS_REST_TOKEN,
   ANTHROPIC_API_KEY,
 
-  // FAST defaults for Builder
+  // runtime knobs
   ANTHROPIC_MODEL = "claude-3-haiku-20240307",
   SUMMARIZER_MODEL = "claude-3-haiku-20240307",
   MAX_OUTPUT_TOKENS = "300",
   TEMPERATURE = "0.2",
-  TIMEOUT_MS = "9000",            // <—— щоб влізти у Builder ~10s
-  HISTORY_KEEP = "10",            // менше повідомлень → швидше
-  SUMMARIZE_THRESHOLD = "120",    // коли >120 меседжів — стискаємо
+  // if UI_PROFILE=builder -> 9000ms, otherwise 30000ms
+  UI_PROFILE = "",
+  TIMEOUT_MS = (UI_PROFILE === "builder" ? "9000" : "30000"),
+  HISTORY_KEEP = "10",
+  SUMMARIZE_THRESHOLD = "120",
   SUMMARY_MAX_TOKENS = "250",
-  TTL_SECONDS = String(60 * 60 * 24 * 7), // 7 днів
-  CORE_SYSTEM_PROMPT = ""
+  TTL_SECONDS = String(60 * 60 * 24 * 7), // 7 days
+  CORE_SYSTEM_PROMPT = "",
+  // optional safety caps
+  BODY_LIMIT_BYTES = String(5 * 1024 * 1024), // 5MB default
+  MAX_INPUT_CHARS = "0" // 0 = no cap
 } = process.env;
 
 if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) throw new Error("Missing Upstash env");
 if (!ANTHROPIC_API_KEY) throw new Error("Missing ANTHROPIC_API_KEY");
 
-const app = Fastify({ logger: true });
+const app = Fastify({
+  logger: true,
+  bodyLimit: Number(BODY_LIMIT_BYTES) // allow large request bodies
+});
 app.register(cors, { origin: true });
 
 const redis = new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN });
@@ -68,13 +76,18 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
       },
       body: JSON.stringify({
         model,
-        system,                   // <-- system prompt тут (НЕ в messages)
-        messages,                 // <-- тільки user/assistant
+        system,                   // system prompt here
+        messages,                 // only user/assistant
         max_tokens: maxTokens,
         temperature
       })
     });
-    if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await res.text().catch(() => "")}`);
+
+    if (!res.ok) {
+      const detail = await res.text().catch(() => "");
+      throw new Error(`Anthropic ${res.status}: ${detail}`);
+    }
+
     return await res.json();
   } finally {
     clearTimeout(timer);
@@ -83,11 +96,11 @@ async function callAnthropic({ model, system, messages, maxTokens, temperature, 
 
 app.get("/health", async () => ({ ok: true }));
 
-// -------------------- FIXED HANDLER --------------------
+// -------------------- MAIN HANDLER --------------------
 app.post("/v1/complete", async (req, reply) => {
   const t0 = Date.now();
   try {
-    // НОРМАЛІЗАЦІЯ ТІЛА (без дубль-парсингу)
+    // parse body (no double parsing)
     let body = req.body;
     if (typeof body === "string") {
       try { body = JSON.parse(body); }
@@ -105,40 +118,45 @@ app.post("/v1/complete", async (req, reply) => {
     const histKey = `hist:${core_id}:${session_id}`;
     const sumKey  = `sum:${core_id}:${session_id}`;
 
-    // SAFE PARSE для Redis
+    // safe JSON parse helper
     const safeParse = (v) => {
       if (typeof v === "string") { try { return JSON.parse(v); } catch { return null; } }
       return v && typeof v === "object" ? v : null;
     };
 
-    // recent
+    // recent history
     const keepN = num(HISTORY_KEEP, 10);
     const recent = await redis.lrange(histKey, -keepN, -1);
     const recentMsgs = (recent || []).map(safeParse).filter(Boolean);
 
-    // summary
+    // memory summary
     const summary = await redis.get(sumKey);
 
-    // assemble messages (ЛИШЕ user/assistant)
+    // normalize + optional cap
+    const cap = num(MAX_INPUT_CHARS, 0);
+    let cleanPrompt = String(prompt).replace(/\r/g, "").replace(/\t/g, " ").replace(/ {2,}/g, " ").trim();
+    if (cap > 0 && cleanPrompt.length > cap) cleanPrompt = cleanPrompt.slice(0, cap);
+
+    // assemble messages (user/assistant only)
     const messages = [];
     if (recentMsgs.length) messages.push(...recentMsgs);
-    messages.push({ role: "user", content: String(prompt) });
+    messages.push({ role: "user", content: cleanPrompt });
 
-    // main answer (fast)
+    // main answer
     const res = await callAnthropic({
       model: ANTHROPIC_MODEL,
-      system: buildSystem(locale, summary),   // <-- summary в system prompt
+      system: buildSystem(locale, summary),
       messages,
       maxTokens: num(MAX_OUTPUT_TOKENS, 300),
       temperature: num(TEMPERATURE, 0.2),
-      timeoutMs: num(TIMEOUT_MS, 9000)
+      timeoutMs: num(TIMEOUT_MS, 30000)
     });
 
     const modelReply = res?.content?.[0]?.text || "";
     if (!modelReply) throw new Error("Invalid Claude response");
 
     // persist
-    await redis.rpush(histKey, JSON.stringify({ role: "user", content: String(prompt) }));
+    await redis.rpush(histKey, JSON.stringify({ role: "user", content: cleanPrompt }));
     await redis.rpush(histKey, JSON.stringify({ role: "assistant", content: modelReply }));
     await redis.expire(histKey, num(TTL_SECONDS, 604800));
     await redis.expire(sumKey, num(TTL_SECONDS, 604800));
@@ -178,10 +196,11 @@ app.post("/v1/complete", async (req, reply) => {
     return reply.send({ reply: modelReply });
   } catch (e) {
     req.log.error(e);
-    return reply.code(500).send({ error: "Internal Server Error" });
+    // propagate real upstream error to client
+    return reply.code(502).send({ error: String(e?.message || e) });
   }
 });
-// ------------------ END FIXED HANDLER -------------------
+// ------------------ END HANDLER -------------------
 
 app.listen({ port: Number(process.env.PORT || 3000), host: "0.0.0.0" }, (err, address) => {
   if (err) { app.log.error(err); process.exit(1); }
