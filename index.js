@@ -1,7 +1,6 @@
 // index.js — FAST profile (hardened: json-only, stable reply, metrics, ratelimit)
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import multipart from "@fastify/multipart"; // на майбутнє; зараз не використовуємо
 import { Redis } from "@upstash/redis";
 import fetch from "node-fetch";
 import crypto from "crypto";
