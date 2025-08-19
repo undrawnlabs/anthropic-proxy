@@ -256,7 +256,24 @@ app.post("/v1/complete", async (req, reply) => {
       }).slice(0, 256)
     );
 
-    return reply.code(200).send(jsonReply(modelReply));
+    return reply.code(200).send({
+  id: "chatcmpl_" + crypto.randomUUID(),
+  object: "chat.completion",
+  model: ANTHROPIC_MODEL,
+  created: Math.floor(Date.now() / 1000),
+  choices: [
+    {
+      index: 0,
+      message: { role: "assistant", content: modelReply },
+      finish_reason: "stop"
+    }
+  ],
+  usage: {
+    prompt_tokens: prompt.length,  // можна краще рахувати
+    completion_tokens: modelReply.length,
+    total_tokens: prompt.length + modelReply.length
+  }
+});
   } catch (e) {
     metrics.errors_total++;
     const ms = Date.now() - t0; recordLatency(ms);
