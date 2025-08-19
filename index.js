@@ -70,9 +70,34 @@ const metrics = {
 };
 const lastLatencies = [];
 
+// ---------- OpenWebUI/OpenAI-like response wrapper ----------
 function jsonReply(replyObj) {
-  return { reply: String(replyObj ?? "") };
+  const text = String(replyObj ?? "");
+  return {
+    id: crypto.randomUUID(),
+    object: "chat.completion",
+    model: "hanna-core",
+    created: Math.floor(Date.now() / 1000),
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text }
+          ]
+        },
+        finish_reason: "stop"
+      }
+    ],
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: text.length,
+      total_tokens: text.length
+    }
+  };
 }
+
 function recordLatency(ms) {
   metrics.last_ms = ms;
   lastLatencies.push(ms);
@@ -224,9 +249,12 @@ app.post("/v1/complete", async (req, reply) => {
     }
 
     const ms = Date.now() - t0; recordLatency(ms);
-    reply.header("X-Core-Diag", JSON.stringify({
-      ms, req_id: req.id, has_summary: Boolean(summary), history_count: recentMsgs.length
-    }).slice(0, 256));
+    reply.header(
+      "X-Core-Diag",
+      JSON.stringify({
+        ms, req_id: req.id, has_summary: Boolean(summary), history_count: recentMsgs.length
+      }).slice(0, 256)
+    );
 
     return reply.code(200).send(jsonReply(modelReply));
   } catch (e) {
