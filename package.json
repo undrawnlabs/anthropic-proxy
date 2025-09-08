@@ -6,12 +6,13 @@
     "anthropic-proxy": "index.js"
   },
   "scripts": {
-    "start": "node index.js",
-    "lint": "node --check index.js"
-},
+    "dev": "tsx src/server.ts",
+    "build": "tsup",
+    "start": "node dist/server.js"
+  },
   "engines": {
-  "node": "18.x"
-},
+    "node": "18.x"
+  },
   "keywords": [
     "anthropic",
     "openai",
@@ -32,9 +33,15 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
-    "fastify": "^4.5.2",
-    "node-fetch": "^3.3.2",
     "@fastify/cors": "^8.2.1",
-    "@upstash/redis": "^1.28.4"
+    "@upstash/redis": "^1.28.4",
+    "fastify": "^4.5.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "tsup": "^8.5.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "zod": "^4.1.5"
   }
 }
