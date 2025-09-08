@@ -1,6 +1,6 @@
 // routes/chatCompletions.ts
 import type { FastifyInstance } from "fastify";
-import crypto from "crypto"; // needed for crypto.randomUUID()
+import { randomUUID } from "crypto";
 import { loadEnv } from "../config/env";
 import { getRedis } from "../services/redis";
 import { mapOpenAIToAnthropic } from "../mappers/openaiToAnthropic";
@@ -23,14 +23,16 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
     } = body;
 
     const anthModel = resolveModelAlias(model, env.ANTHROPIC_MODEL);
+
     const session_id =
       (req.headers["x-session-id"] as string) ||
       "sess_" + (req.headers.authorization || req.ip || "anon");
     const core_id = "webui";
     const histKey = `hist:${core_id}:${session_id}`;
     const sumKey = `sum:${core_id}:${session_id}`;
+    const ttl = Number(env.TTL_SECONDS ?? 604800);
 
-    // map OpenAI messages → Anthropic format
+    // OpenAI → Anthropic mapping
     const { system: systemExtra, messages: mapped } = await mapOpenAIToAnthropic(
       messages as any[]
     );
@@ -44,37 +46,39 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
 
     // --------------------- STREAM (SSE) ---------------------
     if (stream) {
-      // 1) send SSE headers immediately to keep connection open
+      // SSE headers
       reply.raw.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-        // helpful behind some proxies (not strictly required)
+        Connection: "keep-alive",
         "X-Accel-Buffering": "no"
       });
 
-      // 2) timeout + heartbeat (to avoid CF 524)
+      // Timeout/ping (CF 524 mitigation)
       const controller = new AbortController();
-      const hardTimeout = Math.min(Number(env.TIMEOUT_MS) || 30000, 60000); // < 100s for CF
+      const hardTimeout = Math.min(Number(env.TIMEOUT_MS) || 30000, 60000);
       const timer = setTimeout(() => controller.abort(), hardTimeout);
       const ping = setInterval(() => {
         try { reply.raw.write(": ping\n\n"); } catch {}
       }, 15000);
 
-      // helpful: send a minimal first chunk so the UI renders the stream instantly
-      const startChunk = {
-        id: "chatcmpl_" + crypto.randomUUID(),
-        object: "chat.completion.chunk",
-        model: anthModel,
-        created: Math.floor(Date.now() / 1000),
-        choices: [{ index: 0, delta: { content: "" }, finish_reason: null }]
-      };
-      try { reply.raw.write(`data: ${JSON.stringify(startChunk)}\n\n`); } catch {}
-
-      let r: Response | null = null;
+      // Ранний пустой чанк, чтобы UI сразу показал поток
       try {
-        // 3) call Anthropic with stream: true
-        r = await fetch("https://api.anthropic.com/v1/messages", {
+        reply.raw.write(
+          `data: ${JSON.stringify({
+            id: "chatcmpl_" + randomUUID(),
+            object: "chat.completion.chunk",
+            model: anthModel,
+            created: Math.floor(Date.now() / 1000),
+            choices: [{ index: 0, delta: { content: "" }, finish_reason: null }]
+          })}\n\n`
+        );
+      } catch {}
+
+      let upstream: Response | null = null;
+
+      try {
+        upstream = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           signal: controller.signal,
           headers: {
@@ -94,25 +98,23 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
           })
         });
 
-        if (!r.ok || !r.body) {
-          const detail = r && !r.ok ? await r.text().catch(() => "") : "no body";
-          reply.raw.write(
-            `data: ${JSON.stringify({ error: { message: `Anthropic stream error: ${detail}` } })}\n\n`
-          );
+        if (!upstream.ok || !upstream.body) {
+          const detail = upstream && !upstream.ok ? await upstream.text().catch(() => "") : "no body";
+          reply.raw.write(`data: ${JSON.stringify({ error: { message: `Anthropic stream error: ${detail}` } })}\n\n`);
           reply.raw.write("data: [DONE]\n\n");
           reply.raw.end();
           return;
         }
 
-        // 4) stream Anthropic events → OpenAI-like chunks
+        // Anthropic SSE → OpenAI-like chunks
         const decoder = new TextDecoder();
-        const reader = r.body.getReader();
+        const reader = upstream.body.getReader();
         let buffer = "";
         let accText = "";
 
         const sendChunk = (text: string) => {
           const chunk = {
-            id: "chatcmpl_" + crypto.randomUUID(),
+            id: "chatcmpl_" + randomUUID(),
             object: "chat.completion.chunk",
             model: anthModel,
             created: Math.floor(Date.now() / 1000),
@@ -124,44 +126,51 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
+
           buffer += decoder.decode(value, { stream: true });
-          const parts = buffer.split("\n\n");
-          buffer = parts.pop() || "";
+          const blocks = buffer.split("\n\n");
+          buffer = blocks.pop() || "";
 
-          for (const p of parts) {
-            const line = p.trim();
-            if (!line.startsWith("data:")) continue;
-            const data = line.slice(5).trim();
-            if (!data || data === "[DONE]") continue;
-            try {
-              const evt = JSON.parse(data);
-              if (evt.type === "content_block_delta" && evt.delta?.text) {
-                accText += evt.delta.text;
-                sendChunk(evt.delta.text);
+          for (const blk of blocks) {
+            // берем именно строку data: ... из блока (в блоке ещё может быть event:)
+            const m = blk.match(/^data:\s*(.+)$/m);
+            if (!m) continue;
+
+            const payload = m[1].trim();
+            if (!payload || payload === "[DONE]") continue;
+
+            let evt: any;
+            try { evt = JSON.parse(payload); } catch { continue; }
+
+            if (evt.type === "content_block_delta" && evt.delta?.text) {
+              accText += evt.delta.text;
+              sendChunk(evt.delta.text);
+            }
+
+            if (evt.type === "message_stop") {
+              // persist short history
+              const lastUser = (messages as any[]).filter(m => m.role === "user").pop();
+              const userText =
+                typeof lastUser?.content === "string"
+                  ? lastUser.content
+                  : Array.isArray(lastUser?.content)
+                  ? (lastUser.content.find((x: any) => x.type === "text")?.text || "")
+                  : "";
+
+              if (userText) await redis.rpush(histKey, JSON.stringify({ role: "user", content: userText }));
+              if (accText) await redis.rpush(histKey, JSON.stringify({ role: "assistant", content: accText }));
+              if (ttl > 0) {
+                await redis.expire(histKey, ttl);
+                await redis.expire(sumKey, ttl);
               }
-              if (evt.type === "message_stop") {
-                // persist conversation (text-only is enough for memory)
-                const lastUser = (messages as any[]).filter(m => m.role === "user").pop();
-                const userText =
-                  typeof lastUser?.content === "string"
-                    ? lastUser.content
-                    : Array.isArray(lastUser?.content)
-                    ? (lastUser.content.find((x: any) => x.type === "text")?.text || "")
-                    : "";
 
-                if (userText) await redis.rpush(histKey, JSON.stringify({ role: "user", content: userText }));
-                if (accText) await redis.rpush(histKey, JSON.stringify({ role: "assistant", content: accText }));
-                await redis.expire(histKey, env.TTL_SECONDS);
-                await redis.expire(sumKey, env.TTL_SECONDS);
-
-                reply.raw.write("data: [DONE]\n\n");
-                reply.raw.end();
-              }
-            } catch { /* ignore parse noise */ }
+              reply.raw.write("data: [DONE]\n\n");
+              reply.raw.end();
+            }
           }
         }
-      } catch (err: any) {
-        const msg = err?.name === "AbortError" ? "upstream timeout" : String(err?.message || err);
+      } catch (e: any) {
+        const msg = e?.name === "AbortError" ? "upstream timeout" : String(e?.message || e);
         try {
           reply.raw.write(`data: ${JSON.stringify({ error: { message: msg } })}\n\n`);
           reply.raw.write("data: [DONE]\n\n");
@@ -171,7 +180,8 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
         clearTimeout(timer);
         clearInterval(ping);
       }
-      return; // stream branch finished
+
+      return; // stream branch ended
     }
 
     // --------------------- NON-STREAM ---------------------
@@ -200,11 +210,13 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
 
     if (userText) await redis.rpush(histKey, JSON.stringify({ role: "user", content: userText }));
     if (text) await redis.rpush(histKey, JSON.stringify({ role: "assistant", content: text }));
-    await redis.expire(histKey, env.TTL_SECONDS);
-    await redis.expire(sumKey, env.TTL_SECONDS);
+    if (ttl > 0) {
+      await redis.expire(histKey, ttl);
+      await redis.expire(sumKey, ttl);
+    }
 
     return reply.send({
-      id: "chatcmpl_" + crypto.randomUUID(),
+      id: "chatcmpl_" + randomUUID(),
       object: "chat.completion",
       model: anthModel,
       created: Math.floor(Date.now() / 1000),
