@@ -4,6 +4,7 @@ import { getRedis } from "../services/redis"
 import { mapOpenAIToAnthropic } from "../mappers/openaiToAnthropic"
 import { buildSystem } from "../config/buildSystem"
 import { callAnthropic } from "../services/anthropic"
+import { resolveModelAlias } from "../utils/modelAlias"
 
 export default async function chatCompletionsRoutes(app: FastifyInstance) {
   const env = loadEnv()
@@ -11,6 +12,7 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
 
   app.post("/v1/chat/completions", async (req, reply) => {
     const { model = env.ANTHROPIC_MODEL, messages = [], temperature, max_tokens, stream } = (req.body as any) || {}
+    const anthModel = resolveModelAlias(model, env.ANTHROPIC_MODEL);
     const session_id = (req.headers["x-session-id"] as string) || "sess_" + (req.headers.authorization || req.ip || "anon")
     const core_id = "webui"
     const histKey = `hist:${core_id}:${session_id}`
@@ -22,18 +24,22 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
 
     if (stream) {
       reply.raw.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" })
-      const r = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: { "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+       const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
         body: JSON.stringify({
-          model,
+          model: anthModel, // ← здесь
           system,
           messages: mapped.length ? mapped : [{ role: "user", content: [{ type: "text", text: "" }] }],
           max_tokens: Number(max_tokens ?? env.MAX_OUTPUT_TOKENS),
           temperature: Number(temperature ?? env.TEMPERATURE),
           stream: true
         })
-      })
+      });
       if (!r.ok || !r.body) {
         const detail = r && !r.ok ? await r.text().catch(() => "") : "no body"
         reply.code(500).send({ error: { message: `Anthropic stream error: ${detail}` } })
