@@ -98,7 +98,7 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
     }
 
     const res = await callAnthropic(env, {
-      model,
+      model: anthModel,
       system,
       messages: mapped.length ? mapped : [{ role: "user", content: [{ type: "text", text: "" }] }],
       max_tokens: Number(max_tokens ?? env.MAX_OUTPUT_TOKENS),
