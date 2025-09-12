@@ -28,7 +28,8 @@
   "dependencies": {
     "@fastify/cors": "^8.2.1",
     "@upstash/redis": "^1.28.4",
-    "fastify": "^4.5.2"
+    "fastify": "^4.5.2",
+    "tavily": "^1.0.2"
   },
   "devDependencies": {
     "@types/node": "^24.3.1",
