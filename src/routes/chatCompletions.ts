@@ -187,100 +187,115 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
     }
 
     // --------------------- NON-STREAM ---------------------
+const toolsEnabled =
+  String(process.env.WEB_SEARCH_ENABLED ?? "") === "true"
+
+const tools = toolsEnabled ? AnthropicTools : undefined;
+
+type AnthMsg = { role: "user" | "assistant"; content: any[] };
+
+let convo: AnthMsg[] = (mapped.length
+  ? mapped
+  : [{ role: "user", content: [{ type: "text", text: "" }] }]) as AnthMsg[];
+
+let finalText = "";
+const maxToolIterations = 6;
+
+for (let i = 0; i < maxToolIterations; i++) {
+  const res = await callAnthropic(
+    undefined, // ключ берём из process.env внутри callAnthropic
     {
-      // Base messages (you already have `mapped`)
-      const baseMessages = mapped.length
-        ? mapped
-        : [{ role: "user", content: [{ type: "text", text: "" }] }];
+      model: anthModel,
+      system,
+      messages: convo,
+      max_tokens: Number(max_tokens ?? process.env.MAX_OUTPUT_TOKENS ?? 1024),
+      temperature: Number(temperature ?? process.env.TEMPERATURE ?? 0.2),
+      ...(tools ? { tools, tool_choice: "auto" } : {}),
+    },
+    Number(process.env.TIMEOUT_MS ?? 30000)
+  );
 
-      // Single Anthropic Messages API call with tools
-      async function callOnce(messagesPayload: any[]) {
-        const r = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: {
-            "x-api-key": env.ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
+  const blocks = res?.content ?? [];
+  const toolCalls: Array<{ id: string; name: string; input: any }> = [];
+  let textBuf = "";
+
+  for (const b of blocks) {
+    if (b.type === "tool_use") {
+      toolCalls.push({ id: b.id, name: b.name, input: b.input });
+    } else if (b.type === "text" && b.text) {
+      textBuf += b.text;
+    }
+  }
+
+  if (toolCalls.length && toolsEnabled) {
+    // 1) фиксируем ассистентский ответ (с tool_use) как есть
+    convo.push({ role: "assistant", content: blocks });
+
+    // 2) выполняем инструменты и добавляем tool_result (как text-блок)
+    for (const tc of toolCalls) {
+      let result: any;
+      try {
+        result = await executeTool(tc.name, tc.input);
+      } catch (e: any) {
+        result = { error: String(e?.message || e) };
+      }
+
+      convo.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: tc.id,
+            content: [
+              {
+                type: "text",
+                text: typeof result === "string" ? result : JSON.stringify(result),
+              },
+            ],
           },
-          body: JSON.stringify({
-            model: anthModel,
-            system,
-            messages: messagesPayload,
-            tools: AnthropicTools, // expose web_search (and other tools) to the model
-            max_tokens: Number(max_tokens ?? env.MAX_OUTPUT_TOKENS),
-            temperature: Number(temperature ?? env.TEMPERATURE)
-          })
-        });
-        if (!r.ok) throw new Error(await r.text().catch(() => `Anthropic ${r.status}`));
-        return r.json();
-      }
-
-      // Working message array for the tool_use loop
-      const mm: any[] = [...baseMessages];
-
-      // 1) Initial call
-      let response = await callOnce(mm);
-
-      // 2) Tool loop: tool_use -> executeTool -> tool_result -> follow-up call
-      const hasToolUse = (resp: any) =>
-        Array.isArray(resp?.content) && resp.content.some((b: any) => b.type === "tool_use");
-
-      while (hasToolUse(response)) {
-        // Record assistant turn
-        mm.push({ role: "assistant", content: response.content });
-
-        // Execute each tool_use
-        const toolResults: any[] = [];
-        for (const block of response.content) {
-          if (block.type === "tool_use") {
-            const out = await executeTool(block.name, block.input);
-            toolResults.push({
-              type: "tool_result",
-              tool_use_id: block.id,
-              content: JSON.stringify(out)
-            });
-          }
-        }
-
-        // Send tool results as the next user turn
-        mm.push({ role: "user", content: toolResults });
-
-        // Follow-up call
-        response = await callOnce(mm);
-      }
-
-      // 3) Build the final text
-      const text =
-        response?.content?.map((c: any) => (c.type === "text" ? c.text : "")).join("") || "";
-
-      // Persist short history (same logic as before)
-      const lastUser = (messages as any[]).filter(m => m.role === "user").pop();
-      const userText =
-        typeof lastUser?.content === "string"
-          ? lastUser.content
-          : Array.isArray(lastUser?.content)
-          ? (lastUser.content.find((x: any) => x.type === "text")?.text || "")
-          : "";
-
-      if (userText) await redis.rpush(histKey, JSON.stringify({ role: "user", content: userText }));
-      if (text) await redis.rpush(histKey, JSON.stringify({ role: "assistant", content: text }));
-      if (ttl > 0) {
-        await redis.expire(histKey, ttl);
-        await redis.expire(sumKey, ttl);
-      }
-
-      return reply.send({
-        id: "chatcmpl_" + randomUUID(),
-        object: "chat.completion",
-        model: anthModel,
-        created: Math.floor(Date.now() / 1000),
-        choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-        usage: {
-          prompt_tokens: userText?.length || 0,
-          completion_tokens: text.length,
-          total_tokens: (userText?.length || 0) + text.length
-        }
+        ],
       });
     }
+
+    continue; // следующая итерация
+  }
+
+  // инструментов нет → финальный текст
+  finalText = textBuf;
+  break;
+}
+
+const text = finalText || "";
+
+// persist history ↓ (оставляй как у тебя)
+const lastUser = (messages as any[]).filter(m => m.role === "user").pop();
+const userText =
+  typeof lastUser?.content === "string"
+    ? lastUser.content
+    : Array.isArray(lastUser?.content)
+    ? (lastUser.content.find((x: any) => x.type === "text")?.text || "")
+    : "";
+
+if (userText) await redis.rpush(histKey, JSON.stringify({ role: "user", content: userText }));
+if (text) await redis.rpush(histKey, JSON.stringify({ role: "assistant", content: text }));
+if (ttl > 0) {
+  await redis.expire(histKey, ttl);
+  await redis.expire(sumKey, ttl);
+}
+
+return reply.send({
+  id: "chatcmpl_" + randomUUID(),
+  object: "chat.completion",
+  model: anthModel,
+  created: Math.floor(Date.now() / 1000),
+  choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+  usage: {
+    prompt_tokens: userText?.length || 0,
+    completion_tokens: text.length,
+    total_tokens: (userText?.length || 0) + text.length
+  }
+});
+
+
   });
 }

@@ -7,8 +7,8 @@ export type WebSearchArgs = {
 
 export async function webSearch({ query, maxResults = 5 }: WebSearchArgs) {
   if (process.env.WEB_SEARCH_ENABLED !== "true") {
-    throw new Error("Web search disabled by config");
-  }
+  return [{ title: "Web search disabled", url: "", snippet: "" }];
+}
 
   const tavily = new TavilyClient({ apiKey: process.env.TAVILY_API_KEY! });
   const res = await tavily.search({

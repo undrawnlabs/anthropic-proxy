@@ -1,22 +1,28 @@
-import type { Env } from "../config/env"
+// services/anthropic.ts
+export async function callAnthropic(_: any, payload: any, timeoutMs?: number) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("Missing ANTHROPIC_API_KEY");
 
-export async function callAnthropic(env: Env, payload: any, timeoutMs: number) {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const controller = new AbortController();
+  const ms = Number(timeoutMs ?? process.env.TIMEOUT_MS ?? 30000);
+  const timer = setTimeout(() => controller.abort(), ms);
+
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       signal: controller.signal,
       headers: {
-        "x-api-key": env.ANTHROPIC_API_KEY,
+        "x-api-key": apiKey,
         "anthropic-version": "2023-06-01",
-        "content-type": "application/json"
+        "anthropic-beta": "tools-2024-04-04", // <-- обязательно для tools
+        "content-type": "application/json",
+        "accept": "application/json",
       },
-      body: JSON.stringify(payload)
-    })
-    if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await res.text().catch(()=> "")}`)
-    return await res.json()
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`Anthropic ${res.status}: ${await res.text().catch(()=> "")}`);
+    return await res.json();
   } finally {
-    clearTimeout(timer)
+    clearTimeout(timer);
   }
 }
