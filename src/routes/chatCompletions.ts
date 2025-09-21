@@ -10,21 +10,26 @@ import { resolveModelAlias } from "../utils/modelAlias";
 import { AnthropicTools } from "../tools/schema";
 import { executeTool } from "../tools/executeTool";
 
+type AnthMsg = { role: "user" | "assistant"; content: any[] };
+
 export default async function chatCompletionsRoutes(app: FastifyInstance) {
   const env = loadEnv();
   const redis = getRedis(env);
 
   app.post("/v1/chat/completions", async (req, reply) => {
     const body = (req.body as any) || {};
-    const {
+    let {
       model = env.ANTHROPIC_MODEL,
       messages = [],
       temperature,
       max_tokens,
-      stream
+      stream,
     } = body;
 
     const anthModel = resolveModelAlias(model, env.ANTHROPIC_MODEL);
+    const toolsEnabled =
+      String(env.WEB_SEARCH_ENABLED ?? process.env.WEB_SEARCH_ENABLED ?? "") === "true";
+    const tools = toolsEnabled ? AnthropicTools : undefined;
 
     const session_id =
       (req.headers["x-session-id"] as string) ||
@@ -34,37 +39,39 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
     const sumKey = `sum:${core_id}:${session_id}`;
     const ttl = Number(env.TTL_SECONDS ?? 604800);
 
-    // OpenAI → Anthropic mapping
     const { system: systemExtra, messages: mapped } = await mapOpenAIToAnthropic(
       messages as any[]
     );
     const summary = await redis.get(sumKey);
     const system = [
       buildSystem((req.headers["x-locale"] as string) || "auto", summary, env.CORE_SYSTEM_PROMPT),
-      systemExtra
+      systemExtra,
     ]
       .filter(Boolean)
       .join("\n\n");
 
-    // --------------------- STREAM (SSE) ---------------------
+    // Если включены инструменты — используем non-stream (интерактивные tool_use/tool_result циклы)
+    if (stream && toolsEnabled) {
+      stream = false;
+    }
+
     if (stream) {
-      // SSE headers
       reply.raw.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
-        "X-Accel-Buffering": "no"
+        "X-Accel-Buffering": "no",
       });
 
-      // Timeout/ping (CF 524 mitigation)
       const controller = new AbortController();
       const hardTimeout = Math.min(Number(env.TIMEOUT_MS) || 30000, 60000);
       const timer = setTimeout(() => controller.abort(), hardTimeout);
       const ping = setInterval(() => {
-        try { reply.raw.write(": ping\n\n"); } catch {}
+        try {
+          reply.raw.write(": ping\n\n");
+        } catch {}
       }, 15000);
 
-      // Ранний пустой чанк, чтобы UI сразу показал поток
       try {
         reply.raw.write(
           `data: ${JSON.stringify({
@@ -72,21 +79,19 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
             object: "chat.completion.chunk",
             model: anthModel,
             created: Math.floor(Date.now() / 1000),
-            choices: [{ index: 0, delta: { content: "" }, finish_reason: null }]
+            choices: [{ index: 0, delta: { content: "" }, finish_reason: null }],
           })}\n\n`
         );
       } catch {}
 
-      let upstream: Response | null = null;
-
       try {
-        upstream = await fetch("https://api.anthropic.com/v1/messages", {
+        const upstream = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           signal: controller.signal,
           headers: {
             "x-api-key": env.ANTHROPIC_API_KEY,
             "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
+            "content-type": "application/json",
           },
           body: JSON.stringify({
             model: anthModel,
@@ -96,8 +101,8 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
               : [{ role: "user", content: [{ type: "text", text: "" }] }],
             max_tokens: Number(max_tokens ?? env.MAX_OUTPUT_TOKENS),
             temperature: Number(temperature ?? env.TEMPERATURE),
-            stream: true
-          })
+            stream: true,
+          }),
         });
 
         if (!upstream.ok || !upstream.body) {
@@ -105,10 +110,11 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
           reply.raw.write(`data: ${JSON.stringify({ error: { message: `Anthropic stream error: ${detail}` } })}\n\n`);
           reply.raw.write("data: [DONE]\n\n");
           reply.raw.end();
+          clearTimeout(timer);
+          clearInterval(ping);
           return;
         }
 
-        // Anthropic SSE → OpenAI-like chunks
         const decoder = new TextDecoder();
         const reader = upstream.body.getReader();
         let buffer = "";
@@ -120,7 +126,7 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
             object: "chat.completion.chunk",
             model: anthModel,
             created: Math.floor(Date.now() / 1000),
-            choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+            choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
           };
           reply.raw.write(`data: ${JSON.stringify(chunk)}\n\n`);
         };
@@ -134,7 +140,6 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
           buffer = blocks.pop() || "";
 
           for (const blk of blocks) {
-            // берем именно строку data: ... из блока (в блоке ещё может быть event:)
             const m = blk.match(/^data:\s*(.+)$/m);
             if (!m) continue;
 
@@ -142,7 +147,11 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
             if (!payload || payload === "[DONE]") continue;
 
             let evt: any;
-            try { evt = JSON.parse(payload); } catch { continue; }
+            try {
+              evt = JSON.parse(payload);
+            } catch {
+              continue;
+            }
 
             if (evt.type === "content_block_delta" && evt.delta?.text) {
               accText += evt.delta.text;
@@ -150,8 +159,7 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
             }
 
             if (evt.type === "message_stop") {
-              // persist short history
-              const lastUser = (messages as any[]).filter(m => m.role === "user").pop();
+              const lastUser = (messages as any[]).filter((m) => m.role === "user").pop();
               const userText =
                 typeof lastUser?.content === "string"
                   ? lastUser.content
@@ -183,119 +191,106 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
         clearInterval(ping);
       }
 
-      return; // stream branch ended
+      return;
     }
 
-    // --------------------- NON-STREAM ---------------------
-const toolsEnabled =
-  String(process.env.WEB_SEARCH_ENABLED ?? "") === "true"
+    // ---------- NON-STREAM с поддержкой tools (web search) ----------
+    reply.type("application/json; charset=utf-8");
 
-const tools = toolsEnabled ? AnthropicTools : undefined;
+    let convo: AnthMsg[] = (mapped.length
+      ? mapped
+      : [{ role: "user", content: [{ type: "text", text: "" }] }]) as AnthMsg[];
 
-type AnthMsg = { role: "user" | "assistant"; content: any[] };
+    let finalText = "";
+    const maxToolIterations = 6;
 
-let convo: AnthMsg[] = (mapped.length
-  ? mapped
-  : [{ role: "user", content: [{ type: "text", text: "" }] }]) as AnthMsg[];
+    for (let i = 0; i < maxToolIterations; i++) {
+      const res = await callAnthropic(
+        undefined,
+        {
+          model: anthModel,
+          system,
+          messages: convo,
+          max_tokens: Number(max_tokens ?? env.MAX_OUTPUT_TOKENS ?? 1024),
+          temperature: Number(temperature ?? env.TEMPERATURE ?? 0.2),
+          ...(tools ? { tools, tool_choice: { type: "auto" } } : {}),
+        },
+        Number(env.TIMEOUT_MS ?? 30000)
+      );
 
-let finalText = "";
-const maxToolIterations = 6;
+      const blocks = res?.content ?? [];
+      const toolCalls: Array<{ id: string; name: string; input: any }> = [];
+      let textBuf = "";
 
-for (let i = 0; i < maxToolIterations; i++) {
-  const res = await callAnthropic(
-    undefined, // ключ берём из process.env внутри callAnthropic
-    {
-      model: anthModel,
-      system,
-      messages: convo,
-      max_tokens: Number(max_tokens ?? process.env.MAX_OUTPUT_TOKENS ?? 1024),
-      temperature: Number(temperature ?? process.env.TEMPERATURE ?? 0.2),
-      ...(tools ? { tools, tool_choice: { type: "auto" } } : {}),
-    },
-    Number(process.env.TIMEOUT_MS ?? 30000)
-  );
-
-  const blocks = res?.content ?? [];
-  const toolCalls: Array<{ id: string; name: string; input: any }> = [];
-  let textBuf = "";
-
-  for (const b of blocks) {
-    if (b.type === "tool_use") {
-      toolCalls.push({ id: b.id, name: b.name, input: b.input });
-    } else if (b.type === "text" && b.text) {
-      textBuf += b.text;
-    }
-  }
-
-  if (toolCalls.length && toolsEnabled) {
-    // 1) фиксируем ассистентский ответ (с tool_use) как есть
-    convo.push({ role: "assistant", content: blocks });
-
-    // 2) выполняем инструменты и добавляем tool_result (как text-блок)
-    for (const tc of toolCalls) {
-      let result: any;
-      try {
-        result = await executeTool(tc.name, tc.input);
-      } catch (e: any) {
-        result = { error: String(e?.message || e) };
+      for (const b of blocks) {
+        if (b.type === "tool_use") {
+          toolCalls.push({ id: b.id, name: b.name, input: b.input });
+        } else if (b.type === "text" && b.text) {
+          textBuf += b.text;
+        }
       }
 
-      convo.push({
-        role: "user",
-        content: [
-          {
-            type: "tool_result",
-            tool_use_id: tc.id,
+      if (toolCalls.length && toolsEnabled) {
+        convo.push({ role: "assistant", content: blocks });
+
+        for (const tc of toolCalls) {
+          let result: any;
+          let is_error = false;
+          try {
+            result = await executeTool(tc.name, tc.input);
+          } catch (e: any) {
+            result = { error: String(e?.message || e) };
+            is_error = true;
+          }
+
+          convo.push({
+            role: "user",
             content: [
               {
-                type: "text",
-                text: typeof result === "string" ? result : JSON.stringify(result),
+                type: "tool_result",
+                tool_use_id: tc.id,
+                content: typeof result === "string" ? result : JSON.stringify(result),
+                is_error,
               },
             ],
-          },
-        ],
-      });
+          });
+        }
+
+        continue;
+      }
+
+      finalText = textBuf;
+      break;
     }
 
-    continue; // следующая итерация
-  }
+    const text = finalText || "";
 
-  // инструментов нет → финальный текст
-  finalText = textBuf;
-  break;
-}
+    const lastUser = (messages as any[]).filter((m) => m.role === "user").pop();
+    const userText =
+      typeof lastUser?.content === "string"
+        ? lastUser.content
+        : Array.isArray(lastUser?.content)
+        ? (lastUser.content.find((x: any) => x.type === "text")?.text || "")
+        : "";
 
-const text = finalText || "";
+    if (userText) await redis.rpush(histKey, JSON.stringify({ role: "user", content: userText }));
+    if (text) await redis.rpush(histKey, JSON.stringify({ role: "assistant", content: text }));
+    if (ttl > 0) {
+      await redis.expire(histKey, ttl);
+      await redis.expire(sumKey, ttl);
+    }
 
-// persist history ↓ (оставляй как у тебя)
-const lastUser = (messages as any[]).filter(m => m.role === "user").pop();
-const userText =
-  typeof lastUser?.content === "string"
-    ? lastUser.content
-    : Array.isArray(lastUser?.content)
-    ? (lastUser.content.find((x: any) => x.type === "text")?.text || "")
-    : "";
-
-if (userText) await redis.rpush(histKey, JSON.stringify({ role: "user", content: userText }));
-if (text) await redis.rpush(histKey, JSON.stringify({ role: "assistant", content: text }));
-if (ttl > 0) {
-  await redis.expire(histKey, ttl);
-  await redis.expire(sumKey, ttl);
-}
-
-return reply.send({
-  id: "chatcmpl_" + randomUUID(),
-  object: "chat.completion",
-  model: anthModel,
-  created: Math.floor(Date.now() / 1000),
-  choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
-  usage: {
-    prompt_tokens: userText?.length || 0,
-    completion_tokens: text.length,
-    total_tokens: (userText?.length || 0) + text.length
-  }
-});
-
-
+    return reply.send({
+      id: "chatcmpl_" + randomUUID(),
+      object: "chat.completion",
+      model: anthModel,
+      created: Math.floor(Date.now() / 1000),
+      choices: [{ index: 0, message: { role: "assistant", content: text }, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: userText?.length || 0,
+        completion_tokens: text.length,
+        total_tokens: (userText?.length || 0) + text.length,
+      },
+    });
   });
 }
