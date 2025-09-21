@@ -14,7 +14,7 @@ export async function callAnthropic(_: any, payload: any, timeoutMs?: number) {
       headers: {
         "x-api-key": apiKey,
         "anthropic-version": "2023-06-01",
-        "anthropic-beta": "tools-2024-04-04", // <-- обязательно для tools
+        "anthropic-beta": "tools-2024-04-04",
         "content-type": "application/json",
         "accept": "application/json",
       },

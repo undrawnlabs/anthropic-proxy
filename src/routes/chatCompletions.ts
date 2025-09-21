@@ -210,7 +210,7 @@ for (let i = 0; i < maxToolIterations; i++) {
       messages: convo,
       max_tokens: Number(max_tokens ?? process.env.MAX_OUTPUT_TOKENS ?? 1024),
       temperature: Number(temperature ?? process.env.TEMPERATURE ?? 0.2),
-      ...(tools ? { tools, tool_choice: "auto" } : {}),
+      ...(tools ? { tools, tool_choice: { type: "auto" } } : {}),
     },
     Number(process.env.TIMEOUT_MS ?? 30000)
   );
