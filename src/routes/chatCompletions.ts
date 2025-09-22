@@ -27,8 +27,7 @@ export default async function chatCompletionsRoutes(app: FastifyInstance) {
     } = body;
 
     const anthModel = resolveModelAlias(model, env.ANTHROPIC_MODEL);
-    const toolsEnabled =
-      String(env.WEB_SEARCH_ENABLED ?? process.env.WEB_SEARCH_ENABLED ?? "") === "true";
+    const toolsEnabled = process.env.WEB_SEARCH_ENABLED === "true";
     const tools = toolsEnabled ? AnthropicTools : undefined;
 
     const session_id =
