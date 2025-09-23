@@ -1,3 +1,8 @@
+import 'dotenv/config';
+import fs from "fs";
+import path from "path";
+import process from "process";
+
 export type Env = {
   UPSTASH_REDIS_REST_URL: string
   UPSTASH_REDIS_REST_TOKEN: string
@@ -22,7 +27,21 @@ export type Env = {
 const n = (v: any, d: number) => (Number.isFinite(Number(v)) ? Number(v) : d)
 
 export function loadEnv(): Env {
+
   const e = process.env
+
+    // If a file path is given, read it and assign to CORE_SYSTEM_PROMPT
+  if (e.CORE_SYSTEM_PROMPT_FILE) {
+    try {
+      const abs = path.resolve(e.CORE_SYSTEM_PROMPT_FILE);
+      const fileContent = fs.readFileSync(abs, "utf8");
+      e.CORE_SYSTEM_PROMPT = fileContent.trim();
+
+    } catch (err) {
+      console.error("Failed to load CORE_SYSTEM_PROMPT_FILE:", err);
+    }
+  }
+
   if (!e.UPSTASH_REDIS_REST_URL || !e.UPSTASH_REDIS_REST_TOKEN) throw new Error("Missing Upstash env")
   if (!e.ANTHROPIC_API_KEY) throw new Error("Missing ANTHROPIC_API_KEY")
 
